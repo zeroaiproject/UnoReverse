@@ -55,12 +55,22 @@ const NAVIGATE_HEADERS = {
   "sec-fetch-user": "?1",
 };
 
-// --- Utilities ---
+// --- Errors, retry, and reliability utilities ---
 
-function assertFetch(fetchImpl) {
-  if (!fetchImpl) throw new Error("fetch is not available in this environment");
-  return fetchImpl;
-}
+const ERROR_CODES = Object.freeze({
+  FETCH_UNAVAILABLE: "FETCH_UNAVAILABLE",
+  INVALID_INPUT: "INVALID_INPUT",
+  CONVERSATION_NOT_FOUND: "CONVERSATION_NOT_FOUND",
+  HTTP_ERROR: "HTTP_ERROR",
+  RATE_LIMITED: "RATE_LIMITED",
+  TIMEOUT: "TIMEOUT",
+  ABORTED: "ABORTED",
+  NETWORK_ERROR: "NETWORK_ERROR",
+  PARSE_ERROR: "PARSE_ERROR",
+  STREAM_ERROR: "STREAM_ERROR",
+  UNKNOWN_TOOL: "UNKNOWN_TOOL",
+  INTERNAL_ERROR: "INTERNAL_ERROR",
+});
 
 function sleep(ms, signal) {
   if (!ms || ms <= 0) return Promise.resolve();
@@ -69,13 +79,13 @@ function sleep(ms, signal) {
     if (signal) {
       if (signal.aborted) {
         clearTimeout(t);
-        return reject(signal.reason || new Error("aborted"));
+        return reject(Object.assign(new Error("Request aborted"), { name: "AbortError" }));
       }
       signal.addEventListener(
         "abort",
         () => {
           clearTimeout(t);
-          reject(signal.reason || new Error("aborted"));
+          reject(Object.assign(new Error("Request aborted"), { name: "AbortError" }));
         },
         { once: true }
       );
@@ -86,12 +96,18 @@ function sleep(ms, signal) {
 function withTimeout(signal, timeoutMs) {
   if (!timeoutMs || timeoutMs <= 0) return { signal, cleanup: () => {} };
   const ctrl = new AbortController();
-  const onAbort = () => ctrl.abort(signal && signal.reason);
+  const onAbort = () => {
+    try { ctrl.abort(signal && signal.reason); } catch (_) { ctrl.abort(); }
+  };
   if (signal) {
-    if (signal.aborted) ctrl.abort(signal.reason);
+    if (signal.aborted) onAbort();
     else signal.addEventListener("abort", onAbort, { once: true });
   }
-  const t = setTimeout(() => ctrl.abort(new Error(`timeout after ${timeoutMs}ms`)), timeoutMs);
+  const t = setTimeout(() => {
+    const e = new Error(`timeout after ${timeoutMs}ms`);
+    e.code = ERROR_CODES.TIMEOUT;
+    try { ctrl.abort(e); } catch (_) { ctrl.abort(); }
+  }, timeoutMs);
   return {
     signal: ctrl.signal,
     cleanup: () => {
@@ -99,6 +115,194 @@ function withTimeout(signal, timeoutMs) {
       if (signal) signal.removeEventListener("abort", onAbort);
     },
   };
+}
+
+class BraveLeoError extends Error {
+  constructor(message, opts = {}) {
+    super(message || "BraveLeoError");
+    this.name = "BraveLeoError";
+    this.code = opts.code || ERROR_CODES.INTERNAL_ERROR;
+    this.status = opts.status ?? null;
+    this.retryable = !!opts.retryable;
+    this.retryAfterMs = opts.retryAfterMs ?? null;
+    this.details = opts.details ?? null;
+    this.cause = opts.cause;
+    this.conversation = opts.conversation ?? null;
+  }
+  toJSON() {
+    return {
+      name: this.name,
+      code: this.code,
+      message: this.message,
+      status: this.status,
+      retryable: this.retryable,
+      retryAfterMs: this.retryAfterMs,
+      details: this.details,
+      conversation: this.conversation,
+    };
+  }
+}
+
+function asError(error, fallback = {}) {
+  if (error instanceof BraveLeoError) return error;
+  const e = error || {};
+  const msg = e && e.message ? String(e.message) : String(error || fallback.message || "Unknown error");
+  return new BraveLeoError(msg, { ...fallback, cause: error });
+}
+
+function truncate(str, max = 2000) {
+  if (str == null) return str;
+  const s = typeof str === "string" ? str : (() => { try { return JSON.stringify(str); } catch (_) { return String(str); } })();
+  return s.length > max ? s.slice(0, max) + `...[truncated ${s.length - max} chars]` : s;
+}
+
+function parseRetryAfter(headers) {
+  if (!headers) return null;
+  const h = typeof headers.get === "function" ? headers.get("retry-after") : (headers["retry-after"] || headers["Retry-After"]);
+  if (h == null) return null;
+  const n = Number(h);
+  if (Number.isFinite(n)) return Math.max(0, n * 1000);
+  const d = Date.parse(String(h));
+  if (Number.isFinite(d)) return Math.max(0, d - Date.now());
+  return null;
+}
+
+function isAbortError(e) {
+  return !!(e && (e.name === "AbortError" || e.code === "ABORT_ERR"));
+}
+
+function isTimeoutError(e) {
+  return !!(e && (e.code === ERROR_CODES.TIMEOUT || /timeout/i.test(e.message || "")));
+}
+
+function classifyError(error, context = {}) {
+  if (error instanceof BraveLeoError) return error;
+  if (isAbortError(error)) {
+    const timeout = isTimeoutError(error) || isTimeoutError(error && error.cause) || /timeout/i.test(String((error && error.message) || ""));
+    return new BraveLeoError(timeout ? "Request timed out" : "Request aborted", {
+      code: timeout ? ERROR_CODES.TIMEOUT : ERROR_CODES.ABORTED,
+      retryable: timeout,
+      status: context.status ?? null,
+      conversation: context.conversation ?? null,
+      cause: error,
+    });
+  }
+  const status = error && (error.status ?? error.statusCode);
+  if (Number.isFinite(status)) {
+    const retryAfterMs = parseRetryAfter(error.headers) ?? error.retryAfterMs ?? null;
+    const rate = status === 429;
+    return new BraveLeoError(error.message || `HTTP ${status}`, {
+      code: rate ? ERROR_CODES.RATE_LIMITED : ERROR_CODES.HTTP_ERROR,
+      status,
+      retryable: !!(error.retryable || isRetryableStatus(status)),
+      retryAfterMs,
+      details: error.body ? truncate(error.body, 1500) : (error.details ?? null),
+      conversation: context.conversation ?? error.conversation ?? null,
+      cause: error,
+    });
+  }
+  // Fetch/network failures often surface as TypeError with no status
+  if (error && (error.name === "TypeError" || /fetch|network|ECONN|ENOTFOUND|EAI_AGAIN|socket/i.test(error.message || ""))) {
+    return new BraveLeoError(error.message || "Network request failed", {
+      code: ERROR_CODES.NETWORK_ERROR,
+      retryable: true,
+      conversation: context.conversation ?? null,
+      cause: error,
+    });
+  }
+  return new BraveLeoError(error && error.message ? error.message : String(error), {
+    code: ERROR_CODES.INTERNAL_ERROR,
+    retryable: false,
+    conversation: context.conversation ?? null,
+    cause: error,
+  });
+}
+
+function computeBackoffMs(attempt, opts = {}) {
+  const base = Math.max(0, Number(opts.retryDelayMs ?? 500));
+  const max = Math.max(base, Number(opts.maxRetryDelayMs ?? 8000));
+  const exp = Math.min(max, base * Math.pow(2, Math.max(0, attempt)));
+  // full jitter
+  const jitter = Math.floor(Math.random() * Math.max(1, exp));
+  return Math.min(max, jitter + Math.floor(exp * 0.25));
+}
+
+async function withRetry(fn, opts = {}) {
+  const retries = Math.max(0, Number(opts.retries ?? 0) || 0);
+  const signal = opts.signal;
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn(attempt);
+    } catch (e) {
+      const err = classifyError(e, opts.context || {});
+      const canRetry =
+        attempt < retries &&
+        err.retryable &&
+        !(signal && signal.aborted) &&
+        err.code !== ERROR_CODES.ABORTED &&
+        (typeof opts.retryOn === "function" ? opts.retryOn(err, attempt) : true);
+      if (!canRetry) throw err;
+      const wait = err.retryAfterMs != null ? Math.min(err.retryAfterMs, opts.maxRetryDelayMs ?? 15000) : computeBackoffMs(attempt, opts);
+      if (typeof opts.onRetry === "function") {
+        try { opts.onRetry({ attempt: attempt + 1, retries, waitMs: wait, error: err }); } catch (_) {}
+      }
+      await sleep(wait, signal);
+      attempt++;
+    }
+  }
+}
+
+// --- Usage/token tracking ---
+
+function emptyUsage() {
+  return { prompt_tokens: 0, completion_tokens: 0, reasoning_tokens: 0, total_tokens: 0, requests: 0 };
+}
+
+function addUsage(target, usage) {
+  if (!usage || typeof usage !== "object") return target;
+  const p = Number(usage.prompt_tokens || 0) || 0;
+  const c = Number(usage.completion_tokens || 0) || 0;
+  const r = Number(usage.reasoning_tokens || 0) || 0;
+  target.prompt_tokens += p;
+  target.completion_tokens += c;
+  target.reasoning_tokens += r;
+  target.total_tokens += p + c + r;
+  target.requests += 1;
+  target.last = {
+    prompt_tokens: usage.prompt_tokens ?? null,
+    completion_tokens: usage.completion_tokens ?? null,
+    reasoning_tokens: usage.reasoning_tokens ?? null,
+  };
+  return target;
+}
+
+class UsageTracker {
+  constructor() {
+    this.usage = emptyUsage();
+  }
+  record(usage) {
+    addUsage(this.usage, usage);
+    return this.snapshot();
+  }
+  snapshot() {
+    return JSON.parse(JSON.stringify(this.usage));
+  }
+  reset() {
+    this.usage = emptyUsage();
+  }
+}
+
+// --- Fetch/assert ---
+
+function assertFetch(fetchImpl) {
+  if (!fetchImpl) {
+    throw new BraveLeoError("fetch is not available in this environment", {
+      code: ERROR_CODES.FETCH_UNAVAILABLE,
+      retryable: false,
+    });
+  }
+  return fetchImpl;
 }
 
 function normalizeConversationId(id) {
@@ -577,10 +781,25 @@ function isRetryableStatus(status) {
   return status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599);
 }
 
+function isRetryableNetworkError(error) {
+  if (!error) return false;
+  if (isAbortError(error)) return false;
+  const msg = String(error.message || error || "");
+  return (
+    error.name === "TypeError" ||
+    /fetch failed|network|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|socket hang up/i.test(msg)
+  );
+}
+
 async function streamWithAskOnce(conversation, opts = {}) {
   const fetchImpl = assertFetch(opts.fetchImpl || globalThis.fetch);
   const conv = normalizeConversationId(conversation) || String(conversation || "").trim();
-  if (!conv) throw new Error("conversation id is required");
+  if (!conv) {
+    throw new BraveLeoError("conversation id is required", {
+      code: ERROR_CODES.INVALID_INPUT,
+      retryable: false,
+    });
+  }
 
   const jar = opts.cookieJar instanceof CookieJar ? opts.cookieJar : new CookieJar(opts.cookies);
   const url = buildWithAskUrl(conv, opts.enableInlineEntities !== false);
@@ -592,20 +811,27 @@ async function streamWithAskOnce(conversation, opts = {}) {
   );
 
   const t = withTimeout(opts.signal, opts.timeoutMs);
+  let res;
   try {
-    const res = await fetchImpl(url, { method: "GET", headers, signal: t.signal });
+    try {
+      res = await fetchImpl(url, { method: "GET", headers, signal: t.signal });
+    } catch (e) {
+      throw classifyError(e, { conversation: conv });
+    }
     jar.ingestResponse(res);
 
     const resHeaders = headersToObject(res.headers);
     if (!res.ok) {
       const bodyText = await safeReadText(res);
-      const err = new Error(`with_ask request failed: ${res.status} ${res.statusText || ""}`.trim());
-      err.status = res.status;
-      err.headers = resHeaders;
-      err.body = bodyText;
-      err.conversation = conv;
-      err.retryable = isRetryableStatus(res.status);
-      throw err;
+      const retryAfterMs = parseRetryAfter(res.headers) ?? parseRetryAfter(resHeaders);
+      throw new BraveLeoError(`with_ask request failed: ${res.status} ${res.statusText || ""}`.trim(), {
+        code: res.status === 429 ? ERROR_CODES.RATE_LIMITED : ERROR_CODES.HTTP_ERROR,
+        status: res.status,
+        retryable: isRetryableStatus(res.status),
+        retryAfterMs,
+        details: truncate(bodyText, 1500),
+        conversation: conv,
+      });
     }
 
     const state = { deltaText: "", stopText: null, usage: null, followups: [], enrichments: null, started: false, stopped: false };
@@ -613,14 +839,21 @@ async function streamWithAskOnce(conversation, opts = {}) {
     const includeEvents = opts.includeEvents !== false;
     const onEvent = typeof opts.onEvent === "function" ? opts.onEvent : null;
     const incremental = opts.incremental !== false && !!res.body;
+    let streamError = null;
 
     const consume = async (iter) => {
-      for await (const ev of iter) {
-        if (includeEvents) events.push(ev);
-        applyEvent(state, ev);
-        if (onEvent) {
-          try { onEvent(ev, { ...finalizeState(state), partial: true, conversation: conv }); } catch (_) {}
+      try {
+        for await (const ev of iter) {
+          if (includeEvents) events.push(ev);
+          applyEvent(state, ev);
+          if (onEvent) {
+            try { onEvent(ev, { ...finalizeState(state), partial: true, conversation: conv }); } catch (_) {}
+          }
         }
+      } catch (e) {
+        streamError = classifyError(e, { conversation: conv });
+        streamError.code = isAbortError(e) ? streamError.code : ERROR_CODES.STREAM_ERROR;
+        streamError.retryable = false; // partial stream already consumed
       }
     };
 
@@ -632,8 +865,8 @@ async function streamWithAskOnce(conversation, opts = {}) {
     }
 
     const reduced = finalizeState(state);
-    return {
-      ok: true,
+    const result = {
+      ok: !streamError,
       conversation: conv,
       answer: reduced.answer,
       text: reduced.text,
@@ -648,31 +881,46 @@ async function streamWithAskOnce(conversation, opts = {}) {
       streamFormat: resHeaders["x-stream-format"] || null,
       cookies: jar.toString() || null,
     };
+    if (streamError) {
+      result.partial = true;
+      result.error = streamError.message;
+      result.errorInfo = streamError.toJSON ? streamError.toJSON() : { message: streamError.message, code: ERROR_CODES.STREAM_ERROR };
+      // Surface partial result to caller instead of throwing away collected data.
+      // Attach for callers that want to throw while keeping partial data.
+      streamError.partialResult = result;
+    }
+    if (opts.usageTracker && result.usage) {
+      try { opts.usageTracker.record(result.usage); } catch (_) {}
+    }
+    if (streamError && !opts.allowPartial) throw streamError;
+    return result;
   } finally {
     t.cleanup();
   }
 }
 
 /**
- * Fetch and consume the `with_ask` stream for a conversation (with optional retries).
+ * Fetch and consume the `with_ask` stream for a conversation (with retries/backoff/rate-limit handling).
  */
 async function streamWithAsk(conversation, opts = {}) {
   const retries = Math.max(0, Number(opts.retries ?? 0) || 0);
-  let attempt = 0;
-  let lastErr;
-  while (attempt <= retries) {
-    try {
-      return await streamWithAskOnce(conversation, opts);
-    } catch (e) {
-      lastErr = e;
-      const retryable = e && (e.retryable || e.name === "AbortError" ? false : isRetryableStatus(e.status));
-      if (attempt >= retries || !retryable || (opts.signal && opts.signal.aborted)) throw e;
-      const backoff = Math.min(2000 * Math.pow(2, attempt), 8000);
-      await sleep(backoff, opts.signal);
-      attempt++;
+  return withRetry(
+    async () => {
+      try {
+        return await streamWithAskOnce(conversation, opts);
+      } catch (e) {
+        throw classifyError(e, { conversation });
+      }
+    },
+    {
+      retries,
+      signal: opts.signal,
+      retryDelayMs: opts.retryDelayMs,
+      maxRetryDelayMs: opts.maxRetryDelayMs,
+      onRetry: opts.onRetry,
+      context: { conversation },
     }
-  }
-  throw lastErr;
+  );
 }
 
 /**
@@ -719,6 +967,7 @@ async function* braveLeoEventStream(conversation, opts = {}) {
 
 function buildAgentResult({ ok, query, conversation, resolution, stream, error, includeEvents = true }) {
   if (!ok) {
+    const errObj = typeof error === "object" && error ? error : null;
     return {
       ok: false,
       query: query || null,
@@ -729,7 +978,8 @@ function buildAgentResult({ ok, query, conversation, resolution, stream, error, 
       followups: [],
       enrichments: null,
       sources: extractSources(null),
-      error: error || "Unknown error",
+      error: errObj ? errObj.message || "Unknown error" : (error || "Unknown error"),
+      errorInfo: errObj && errObj.code ? errObj : (errObj && errObj.errorInfo) || null,
       resolution: resolution || null,
     };
   }
@@ -777,6 +1027,9 @@ function compactResult(result, opts = {}) {
     usage: result.usage || null,
   };
   if (!result.ok) compact.error = result.error || "Unknown error";
+  if (result.errorInfo) compact.errorInfo = result.errorInfo;
+  if (result.status != null) compact.status = result.status;
+  if (result.partial) compact.partial = true;
   if (src.main_entity) compact.main_entity = src.main_entity;
   return compact;
 }
@@ -830,16 +1083,26 @@ async function braveLeoSearch(input = {}) {
     includeEvents = true,
     timeoutMs,
     retries = 0,
+    retryDelayMs,
+    maxRetryDelayMs,
+    onRetry,
+    allowPartial = true,
+    usageTracker,
   } = input;
 
-  let conversation = normalizeConversationId(input.conversation) || (input.conversation ? String(input.conversation).trim() : null);
+  let conversation =
+    normalizeConversationId(input.conversation) ||
+    (input.conversation ? String(input.conversation).trim() : null);
   const jar = input.cookieJar instanceof CookieJar ? input.cookieJar : new CookieJar(cookies);
   let resolution = null;
 
   try {
     if (!conversation) {
       if (!query || !String(query).trim()) {
-        throw new Error("Either 'conversation' or 'query' must be provided");
+        throw new BraveLeoError("Either 'conversation' or 'query' must be provided", {
+          code: ERROR_CODES.INVALID_INPUT,
+          retryable: false,
+        });
       }
       resolution = await resolveConversation(query, {
         source,
@@ -853,16 +1116,21 @@ async function braveLeoSearch(input = {}) {
     }
 
     if (!conversation) {
+      const err = new BraveLeoError(
+        "Could not resolve a Brave chatllm conversation id for the query. " +
+          "Conversation initiation was not fully captured; provide a known 'conversation' id, " +
+          "or pass browser/session cookies in an environment where Brave Search returns a conversation-backed answer.",
+        { code: ERROR_CODES.CONVERSATION_NOT_FOUND, retryable: false }
+      );
       const res = buildAgentResult({
         ok: false,
         query,
         conversation: null,
         resolution,
-        error:
-          "Could not resolve a Brave chatllm conversation id for the query. " +
-          "Conversation initiation was not fully captured; provide a known 'conversation' id, " +
-          "or pass browser/session cookies in an environment where Brave Search returns a conversation-backed answer.",
+        error: err.message,
+        includeEvents,
       });
+      res.errorInfo = err.toJSON();
       res.meta = { resolution, cookies: jar.toString() || null };
       return res;
     }
@@ -883,10 +1151,34 @@ async function braveLeoSearch(input = {}) {
       includeEvents,
       timeoutMs,
       retries,
+      retryDelayMs,
+      maxRetryDelayMs,
+      onRetry,
+      allowPartial,
+      usageTracker,
     });
 
-    return buildAgentResult({ ok: true, query, conversation, resolution, stream, includeEvents });
+    const built = buildAgentResult({ ok: stream.ok !== false, query, conversation, resolution, stream, includeEvents });
+    if (stream.partial) built.partial = true;
+    if (stream.error) built.error = stream.error;
+    if (stream.errorInfo) built.errorInfo = stream.errorInfo;
+    return built;
   } catch (e) {
+    const err = classifyError(e, { conversation });
+    // If a partial stream result was attached, return it with error details.
+    if (err.partialResult && allowPartial) {
+      const pr = err.partialResult;
+      const built = buildAgentResult({ ok: false, query, conversation: pr.conversation || conversation, resolution, stream: pr, includeEvents });
+      built.partial = true;
+      built.answer = pr.answer || "";
+      built.text = pr.text || pr.answer || "";
+      built.usage = pr.usage || null;
+      built.followups = pr.followups || [];
+      built.sources = pr.sources || extractSources(null);
+      built.error = err.message;
+      built.errorInfo = err.toJSON();
+      return built;
+    }
     const out = {
       ok: false,
       query: query || null,
@@ -897,9 +1189,9 @@ async function braveLeoSearch(input = {}) {
       followups: [],
       enrichments: null,
       sources: extractSources(null),
-      error: e && e.message ? e.message : String(e),
-      status: e && e.status,
-      body: e && e.body,
+      error: err.message,
+      errorInfo: err.toJSON(),
+      status: err.status ?? null,
       resolution,
       meta: { cookies: jar.toString() || null },
     };
@@ -926,15 +1218,60 @@ class BraveLeoClient {
   constructor(opts = {}) {
     this.fetchImpl = opts.fetchImpl || globalThis.fetch;
     this.cookieJar = opts.cookieJar instanceof CookieJar ? opts.cookieJar : new CookieJar(opts.cookies);
-    this.headers = opts.headers || null;
+    this.headers = opts.headers ? { ...opts.headers } : {};
     this.source = opts.source || "web";
     this.timeoutMs = opts.timeoutMs;
-    this.retries = opts.retries || 0;
+    this.retries = Math.max(0, Number(opts.retries ?? 0) || 0);
+    this.retryDelayMs = opts.retryDelayMs;
+    this.maxRetryDelayMs = opts.maxRetryDelayMs;
+    this.usageTracker = opts.usageTracker instanceof UsageTracker ? opts.usageTracker : new UsageTracker();
+  }
+  setCookies(cookies) {
+    if (cookies instanceof CookieJar) this.cookieJar = cookies.clone();
+    else this.cookieJar = new CookieJar(cookies);
+    return this;
+  }
+  clearCookies() {
+    this.cookieJar = new CookieJar();
+    return this;
+  }
+  setHeader(name, value) {
+    if (!name) return this;
+    if (value == null) delete this.headers[String(name).toLowerCase()];
+    else this.headers[String(name).toLowerCase()] = String(value);
+    return this;
+  }
+  setAuthorization(tokenOrHeader) {
+    if (!tokenOrHeader) return this.setHeader("authorization", null);
+    const v = String(tokenOrHeader);
+    this.setHeader("authorization", /^bearer\s/i.test(v) ? v : `Bearer ${v}`);
+    return this;
+  }
+  exportState() {
+    return {
+      cookies: this.cookieJar.toString() || null,
+      headers: { ...this.headers },
+      source: this.source,
+      usage: this.usageTracker.snapshot(),
+    };
+  }
+  importState(state = {}) {
+    if (state.cookies != null) this.setCookies(state.cookies);
+    if (state.headers && typeof state.headers === "object") this.headers = { ...this.headers, ...state.headers };
+    if (state.source) this.source = state.source;
+    return this;
+  }
+  getUsage() {
+    return this.usageTracker.snapshot();
+  }
+  resetUsage() {
+    this.usageTracker.reset();
+    return this;
   }
   async resolveConversation(query, opts = {}) {
     return resolveConversation(query, {
       fetchImpl: this.fetchImpl,
-      headers: { ...(this.headers || {}), ...(opts.headers || {}) },
+      headers: { ...this.headers, ...(opts.headers || {}) },
       cookieJar: this.cookieJar,
       source: opts.source || this.source,
       timeoutMs: opts.timeoutMs ?? this.timeoutMs,
@@ -948,21 +1285,27 @@ class BraveLeoClient {
       source: this.source,
       timeoutMs: this.timeoutMs,
       retries: this.retries,
+      retryDelayMs: this.retryDelayMs,
+      maxRetryDelayMs: this.maxRetryDelayMs,
       ...opts,
       query,
       fetchImpl: this.fetchImpl,
-      headers: { ...(this.headers || {}), ...(opts.headers || {}) },
+      headers: { ...this.headers, ...(opts.headers || {}) },
       cookieJar: this.cookieJar,
       cookies: undefined, // jar is authoritative
+      usageTracker: this.usageTracker,
     });
   }
   async stream(conversation, opts = {}) {
     return streamWithAsk(conversation, {
       fetchImpl: this.fetchImpl,
-      headers: { ...(this.headers || {}), ...(opts.headers || {}) },
+      headers: { ...this.headers, ...(opts.headers || {}) },
       cookieJar: this.cookieJar,
       timeoutMs: opts.timeoutMs ?? this.timeoutMs,
       retries: opts.retries ?? this.retries,
+      retryDelayMs: opts.retryDelayMs ?? this.retryDelayMs,
+      maxRetryDelayMs: opts.maxRetryDelayMs ?? this.maxRetryDelayMs,
+      usageTracker: this.usageTracker,
       ...opts,
     });
   }
@@ -1113,24 +1456,48 @@ async function braveLeoSearchTool(args = {}) {
  * {name, arguments}, or {tool, input}. Returns a JSON string (default) or object.
  */
 async function executeToolCall(toolCallOrArgs = {}, opts = {}) {
-  const name =
-    toolCallOrArgs &&
-    (toolCallOrArgs.name ||
-      toolCallOrArgs.tool ||
-      (toolCallOrArgs.function && toolCallOrArgs.function.name));
-  if (name && name !== TOOL_NAME) {
-    const err = { ok: false, error: `Unknown tool: ${name}`, expected: TOOL_NAME };
-    return opts.asObject ? err : JSON.stringify(err);
+  try {
+    const name =
+      toolCallOrArgs &&
+      (toolCallOrArgs.name ||
+        toolCallOrArgs.tool ||
+        (toolCallOrArgs.function && toolCallOrArgs.function.name));
+    if (name && name !== TOOL_NAME) {
+      const err = {
+        ok: false,
+        error: `Unknown tool: ${name}`,
+        errorInfo: { code: ERROR_CODES.UNKNOWN_TOOL, message: `Unknown tool: ${name}`, expected: TOOL_NAME },
+        expected: TOOL_NAME,
+      };
+      return opts.asObject ? err : JSON.stringify(err);
+    }
+    const args = normalizeToolArgs(toolCallOrArgs);
+    if (!args.query && toolCallOrArgs && typeof toolCallOrArgs.input === "string") {
+      args.query = toolCallOrArgs.input;
+    }
+    // Merge executor-level defaults (e.g. client-managed cookies/usage/retries)
+    const merged = { ...(opts.defaults || {}), ...args };
+    const result = await braveLeoSearchTool(merged);
+    if (opts.asObject) return result;
+    if (opts.format === "text" || args.format === "text") return result.content || "";
+    return JSON.stringify(result);
+  } catch (e) {
+    const err = classifyError(e);
+    const payload = {
+      ok: false,
+      error: err.message,
+      errorInfo: err.toJSON(),
+      answer: "",
+      citations: [],
+      sources: [],
+      followups: [],
+      usage: null,
+      content: `Error: ${err.message}`,
+    };
+    if (opts.asObject) return payload;
+    if (opts.format === "text") return payload.content;
+    return JSON.stringify(payload);
   }
-  const args = normalizeToolArgs(toolCallOrArgs);
-  // allow passing query as bare first positional via {input} or top-level string handled above
-  if (!args.query && toolCallOrArgs && typeof toolCallOrArgs.input === "string") {
-    args.query = toolCallOrArgs.input;
-  }
-  const result = await braveLeoSearchTool(args);
-  if (opts.asObject) return result;
-  if (opts.format === "text" || args.format === "text") return result.content || "";
-  return JSON.stringify(result);
 }
 
 /** Create an OpenAI tool result message payload. */
@@ -1154,6 +1521,9 @@ const TOOL_SYSTEM_HINT =
 export {
   BRAVE_ORIGIN,
   WITH_ASK_PATH,
+  ERROR_CODES,
+  BraveLeoError,
+  UsageTracker,
   TOOL_NAME,
   TOOL_DESCRIPTION,
   TOOL_PARAMETERS,
@@ -1193,6 +1563,9 @@ try {
     const api = {
       BRAVE_ORIGIN,
       WITH_ASK_PATH,
+      ERROR_CODES,
+      BraveLeoError,
+      UsageTracker,
       TOOL_NAME,
       TOOL_DESCRIPTION,
       TOOL_PARAMETERS,
@@ -1251,6 +1624,7 @@ function parseArgs(argv) {
     source: "web",
     cookies: null,
     timeoutMs: null,
+    retries: 0,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -1262,6 +1636,7 @@ function parseArgs(argv) {
     else if (a === "--source") out.source = argv[++i] || "web";
     else if (a === "--cookies") out.cookies = argv[++i] || null;
     else if (a === "--timeout") out.timeoutMs = Number(argv[++i]) || null;
+    else if (a === "--retries") out.retries = Math.max(0, Number(argv[++i]) || 0);
     else if (a === "--help" || a === "-h") out.help = true;
     else out.queryParts.push(a);
   }
@@ -1283,6 +1658,7 @@ if (isDirectRun) {
           "      --source <src>        Brave search source (default: web)",
           "      --cookies <str>       Cookie header for session continuity",
           "      --timeout <ms>        Request timeout in milliseconds",
+          "      --retries <n>         Retry transient/rate-limit/network failures (default: 0)",
           "      --no-inline-entities  Disable inline entity/enrichment request",
           "      --stream              Print answer deltas live to stdout",
           "      --compact             Print compact LLM-friendly JSON/text result",
@@ -1312,6 +1688,7 @@ if (isDirectRun) {
         source: args.source,
         cookies: args.cookies || undefined,
         timeoutMs: args.timeoutMs || undefined,
+        retries: args.retries || 0,
         onEvent,
         includeEvents: !args.compact,
       });
