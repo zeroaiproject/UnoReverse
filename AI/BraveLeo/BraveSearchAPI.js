@@ -407,6 +407,45 @@ function uniqStrings(items) {
   return out;
 }
 
+function toCitation(item) {
+  if (!item) return null;
+  if (typeof item === "string") {
+    return /^https?:\/\//i.test(item) ? { url: item } : { text: item };
+  }
+  if (typeof item !== "object") return { text: String(item) };
+  const url = item.url || item.link || item.href || item.source_url || null;
+  const title = item.title || item.name || item.heading || null;
+  const snippet =
+    item.snippet || item.description || item.text || item.excerpt || item.summary || null;
+  const source = item.source || item.site || item.domain || item.hostname || null;
+  const out = {};
+  if (url) out.url = String(url);
+  if (title) out.title = String(title);
+  if (snippet) out.snippet = String(snippet);
+  if (source) out.source = String(source);
+  if (item.favicon) out.favicon = String(item.favicon);
+  if (item.page_age || item.age || item.date) out.age = item.page_age || item.age || item.date;
+  return Object.keys(out).length ? out : null;
+}
+
+function dedupeCitations(items) {
+  const out = [];
+  const seen = new Set();
+  for (const it of items || []) {
+    const c = toCitation(it);
+    if (!c) continue;
+    const key =
+      (c.url && `url:${c.url}`) ||
+      (c.title && c.snippet && `ts:${c.title}|${c.snippet}`) ||
+      (c.title && `t:${c.title}`) ||
+      JSON.stringify(c);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(c);
+  }
+  return out;
+}
+
 function extractSources(enrichments) {
   if (!enrichments || typeof enrichments !== "object") {
     return {
@@ -421,6 +460,8 @@ function extractSources(enrichments) {
       entities: [],
       main_entity: null,
       main_entity_infobox: null,
+      predicate: null,
+      citations: [],
       all_urls: [],
     };
   }
@@ -429,23 +470,32 @@ function extractSources(enrichments) {
   const urls = arr(enrichments.urls);
   const reference_urls = arr(enrichments.reference_urls);
   const context_urls = arr(enrichments.context_urls);
+  const context_results = arr(enrichments.context_results);
   const urlLike = (x) => (typeof x === "string" ? x : x && (x.url || x.link || x.href));
   const all_urls = uniqStrings(
-    [...urls, ...reference_urls, ...context_urls, ...references.map(urlLike)].filter(Boolean)
+    [...urls, ...reference_urls, ...context_urls, ...references.map(urlLike), ...context_results.map(urlLike)].filter(Boolean)
   );
+  const citations = dedupeCitations([
+    ...references,
+    ...reference_urls,
+    ...urls,
+    ...context_urls,
+    ...context_results,
+  ]);
   return {
     references,
     urls,
     reference_urls,
     context_urls,
     context: arr(enrichments.context),
-    context_results: arr(enrichments.context_results),
+    context_results,
     images: arr(enrichments.images),
     qa: arr(enrichments.qa),
     entities: arr(enrichments.entities),
     main_entity: enrichments.main_entity ?? null,
     main_entity_infobox: enrichments.main_entity_infobox ?? null,
     predicate: enrichments.predicate ?? null,
+    citations,
     all_urls,
   };
 }
@@ -711,14 +761,18 @@ function compactResult(result, opts = {}) {
   const maxSources = Number.isFinite(opts.maxSources) ? opts.maxSources : 10;
   const maxFollowups = Number.isFinite(opts.maxFollowups) ? opts.maxFollowups : 5;
   const src = result.sources || extractSources(result.enrichments);
-  const sourceUrls = uniqStrings([...(src.all_urls || []), ...(src.references || []), ...(src.urls || []), ...(src.reference_urls || [])])
-    .slice(0, maxSources);
+  const citations = (src.citations || []).slice(0, maxSources);
+  const sourceUrls = uniqStrings([
+    ...(src.all_urls || []),
+    ...citations.map((c) => c && c.url).filter(Boolean),
+  ]).slice(0, maxSources);
   const compact = {
     ok: !!result.ok,
     query: result.query || null,
     conversation: result.conversation || null,
     answer: result.answer || result.text || "",
     followups: Array.isArray(result.followups) ? result.followups.slice(0, maxFollowups) : [],
+    citations,
     sources: sourceUrls,
     usage: result.usage || null,
   };
@@ -734,11 +788,25 @@ function formatResultAsText(result, opts = {}) {
   const parts = [];
   if (result.answer) parts.push(String(result.answer));
   const compact = compactResult(result, opts);
-  if (compact.sources && compact.sources.length) {
+  if (compact.citations && compact.citations.length) {
+    parts.push(
+      "\nSources:\n" +
+        compact.citations
+          .map((c, i) => {
+            const label = c.title ? `${c.title} — ${c.url || ""}` : c.url || c.text || JSON.stringify(c);
+            const snip = c.snippet ? `\n   ${String(c.snippet).slice(0, 180)}` : "";
+            return `${i + 1}. ${label}${snip}`;
+          })
+          .join("\n")
+    );
+  } else if (compact.sources && compact.sources.length) {
     parts.push("\nSources:\n" + compact.sources.map((s, i) => `${i + 1}. ${typeof s === "string" ? s : JSON.stringify(s)}`).join("\n"));
   }
   if (compact.followups && compact.followups.length) {
-    parts.push("\nFollow-ups:\n" + compact.followups.map((f) => `- ${typeof f === "string" ? f : JSON.stringify(f)}`).join("\n"));
+    parts.push(
+      "\nFollow-ups:\n" +
+        compact.followups.map((f) => `- ${typeof f === "string" ? f : JSON.stringify(f)}`).join("\n")
+    );
   }
   return parts.join("\n");
 }
@@ -903,61 +971,196 @@ class BraveLeoClient {
   }
 }
 
-/** OpenAI-compatible tool/function schema for agent tool-calling. */
+// --- Tool-calling integration (agent-friendly) ---
+
+const TOOL_NAME = "brave_leo_search";
+
+const TOOL_DESCRIPTION =
+  "Web search with an AI-grounded answer via Brave Leo / 'Answer with AI' (search.brave.com chatllm). " +
+  "Use for up-to-date web questions, fact-finding, and cited answers. " +
+  "Returns: answer, citations/sources (URLs, titles/snippets when available), follow-up questions, and usage. " +
+  "Pass a natural-language 'query'. A known Brave 'conversation' id can be provided for direct streaming/resume, " +
+  "but conversation creation is best-effort and may require browser/session cookies in some environments.";
+
+const TOOL_PARAMETERS = {
+  type: "object",
+  properties: {
+    query: {
+      type: "string",
+      description:
+        "The web search question or intent to answer (natural language). Example: \"latest Node.js LTS version and release date\".",
+    },
+    conversation: {
+      type: "string",
+      description:
+        "Optional existing Brave chatllm conversation id (hex, ~32 chars as observed). Prefer omitting unless resuming a known conversation.",
+    },
+    enableInlineEntities: {
+      type: "boolean",
+      description: "Request inline entities/enrichments/sources when available (default: true).",
+      default: true,
+    },
+    compact: {
+      type: "boolean",
+      description:
+        "Return compact LLM-friendly payload without raw stream events (default: true for tool calls).",
+      default: true,
+    },
+    format: {
+      type: "string",
+      enum: ["json", "text"],
+      description:
+        "Tool result content format: 'json' (structured, default) or 'text' (formatted answer + sources).",
+      default: "json",
+    },
+  },
+  required: ["query"],
+  additionalProperties: false,
+};
+
+/** OpenAI-compatible tool/function schema. */
 const BRAVE_LEO_TOOL = {
   type: "function",
   function: {
-    name: "brave_leo_search",
-    description:
-      "Web search and AI-grounded answer via Brave Leo / 'Answer with AI' (search.brave.com chatllm). " +
-      "Returns answer text, follow-up suggestions, grounded sources/URLs/entities/context (when available), and token usage. " +
-      "Provide 'query' for best-effort conversation resolution, or a known Brave 'conversation' id for direct streaming.",
-    parameters: {
-      type: "object",
-      properties: {
-        query: {
-          type: "string",
-          description: "Search question or intent to answer with Brave's web-grounded AI.",
-        },
-        conversation: {
-          type: "string",
-          description:
-            "Existing Brave chatllm conversation id (hex, ~32 chars as observed). If omitted, best-effort resolution is attempted for the query.",
-        },
-        enableInlineEntities: {
-          type: "boolean",
-          description: "Request inline entities/enrichments (default: true).",
-          default: true,
-        },
-        source: {
-          type: "string",
-          description: "Brave search source parameter (default: 'web').",
-          default: "web",
-        },
-        compact: {
-          type: "boolean",
-          description:
-            "If true, return a compact LLM-friendly result (answer, followups, source URLs, usage) without raw events.",
-          default: false,
-        },
-      },
-      additionalProperties: false,
-      anyOf: [{ required: ["query"] }, { required: ["conversation"] }],
-    },
+    name: TOOL_NAME,
+    description: TOOL_DESCRIPTION,
+    parameters: TOOL_PARAMETERS,
   },
 };
 
-/** Tool-dispatch wrapper: (args) => Promise<result> */
-async function braveLeoSearchTool(args = {}) {
-  const res = await braveLeoSearch({ ...args, includeEvents: args.compact ? false : args.includeEvents });
-  return args.compact ? compactResult(res) : res;
+/** Convenience: OpenAI `tools` array. */
+const BRAVE_LEO_TOOLS = [BRAVE_LEO_TOOL];
+
+/** Anthropic-style tool schema (input_schema). */
+const BRAVE_LEO_TOOL_ANTHROPIC = {
+  name: TOOL_NAME,
+  description: TOOL_DESCRIPTION,
+  input_schema: TOOL_PARAMETERS,
+};
+
+function safeJsonParse(v) {
+  if (v == null) return {};
+  if (typeof v === "object") return v;
+  if (typeof v !== "string") return {};
+  try {
+    return JSON.parse(v);
+  } catch (_) {
+    return { query: String(v) };
+  }
 }
+
+/** Normalize tool-call argument shapes (string/object/OpenAI function.arguments). */
+function normalizeToolArgs(args) {
+  if (args == null) return {};
+  if (typeof args === "string") return safeJsonParse(args);
+  if (typeof args === "object") {
+    // OpenAI chat tool_call: { function: { name, arguments } }
+    if (args.function && (args.function.arguments || args.function.name)) {
+      return safeJsonParse(args.function.arguments);
+    }
+    // Generic { name, arguments } / { arguments }
+    if (typeof args.arguments === "string") return safeJsonParse(args.arguments);
+    if (args.arguments && typeof args.arguments === "object") return { ...args.arguments };
+    return { ...args };
+  }
+  return {};
+}
+
+function makeToolPayload(result, opts = {}) {
+  const compact = compactResult(result, opts);
+  const payload = {
+    ...compact,
+    content: formatResultAsText(result, opts),
+  };
+  return payload;
+}
+
+/**
+ * Tool-dispatch wrapper optimized for LLM tool calling.
+ * Defaults: compact=true, includeEvents=false.
+ * Returns { ok, query, conversation, answer, citations, sources, followups, usage, content, error? }
+ */
+async function braveLeoSearchTool(args = {}) {
+  const normalized = normalizeToolArgs(args);
+  const compact = normalized.compact !== false; // default true for tool calls
+  const format = normalized.format || "json";
+  const res = await braveLeoSearch({
+    ...normalized,
+    query: normalized.query,
+    conversation: normalized.conversation,
+    includeEvents: compact ? false : normalized.includeEvents !== false,
+  });
+  const payload = makeToolPayload(res);
+  if (format === "text") {
+    return {
+      ok: payload.ok,
+      conversation: payload.conversation,
+      content: payload.content,
+      answer: payload.answer,
+      citations: payload.citations,
+      sources: payload.sources,
+      followups: payload.followups,
+      usage: payload.usage,
+      ...(payload.ok ? {} : { error: payload.error }),
+    };
+  }
+  return payload;
+}
+
+/**
+ * Execute a tool call in common agent formats.
+ * Accepts: raw args object, JSON args string, OpenAI {function:{name,arguments}},
+ * {name, arguments}, or {tool, input}. Returns a JSON string (default) or object.
+ */
+async function executeToolCall(toolCallOrArgs = {}, opts = {}) {
+  const name =
+    toolCallOrArgs &&
+    (toolCallOrArgs.name ||
+      toolCallOrArgs.tool ||
+      (toolCallOrArgs.function && toolCallOrArgs.function.name));
+  if (name && name !== TOOL_NAME) {
+    const err = { ok: false, error: `Unknown tool: ${name}`, expected: TOOL_NAME };
+    return opts.asObject ? err : JSON.stringify(err);
+  }
+  const args = normalizeToolArgs(toolCallOrArgs);
+  // allow passing query as bare first positional via {input} or top-level string handled above
+  if (!args.query && toolCallOrArgs && typeof toolCallOrArgs.input === "string") {
+    args.query = toolCallOrArgs.input;
+  }
+  const result = await braveLeoSearchTool(args);
+  if (opts.asObject) return result;
+  if (opts.format === "text" || args.format === "text") return result.content || "";
+  return JSON.stringify(result);
+}
+
+/** Create an OpenAI tool result message payload. */
+function toToolResultMessage(toolCall, result, opts = {}) {
+  const toolCallId = (toolCall && (toolCall.id || toolCall.tool_call_id)) || opts.toolCallId || null;
+  const content =
+    typeof result === "string" ? result : JSON.stringify(result && result.ok !== undefined ? result : makeToolPayload(result || {}));
+  if (toolCallId) {
+    return { role: "tool", tool_call_id: toolCallId, name: TOOL_NAME, content };
+  }
+  return { role: "tool", name: TOOL_NAME, content };
+}
+
+/** Suggested system hint for agents using this tool. */
+const TOOL_SYSTEM_HINT =
+  `You can call \`${TOOL_NAME}\` for web-grounded answers. ` +
+  `Use the returned \`answer\` as the primary response and cite \`citations\`/\`sources\` when relevant. ` +
+  `If \`ok\` is false, report \`error\` and ask for a known conversation id or browser/session cookies if needed.`;
 
 // --- ESM exports ---
 export {
   BRAVE_ORIGIN,
   WITH_ASK_PATH,
+  TOOL_NAME,
+  TOOL_DESCRIPTION,
+  TOOL_PARAMETERS,
   BRAVE_LEO_TOOL,
+  BRAVE_LEO_TOOLS,
+  BRAVE_LEO_TOOL_ANTHROPIC,
+  TOOL_SYSTEM_HINT,
   CookieJar,
   BraveLeoClient,
   buildSearchUrl,
@@ -971,6 +1174,10 @@ export {
   extractSources,
   compactResult,
   formatResultAsText,
+  makeToolPayload,
+  normalizeToolArgs,
+  executeToolCall,
+  toToolResultMessage,
   resolveConversation,
   streamWithAsk,
   braveLeoEventStream,
@@ -986,7 +1193,13 @@ try {
     const api = {
       BRAVE_ORIGIN,
       WITH_ASK_PATH,
+      TOOL_NAME,
+      TOOL_DESCRIPTION,
+      TOOL_PARAMETERS,
       BRAVE_LEO_TOOL,
+      BRAVE_LEO_TOOLS,
+      BRAVE_LEO_TOOL_ANTHROPIC,
+      TOOL_SYSTEM_HINT,
       CookieJar,
       BraveLeoClient,
       buildSearchUrl,
@@ -1000,6 +1213,10 @@ try {
       extractSources,
       compactResult,
       formatResultAsText,
+      makeToolPayload,
+      normalizeToolArgs,
+      executeToolCall,
+      toToolResultMessage,
       resolveConversation,
       streamWithAsk,
       braveLeoEventStream,
