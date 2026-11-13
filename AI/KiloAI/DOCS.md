@@ -1,115 +1,115 @@
-# Kilo AI — Tor + Gateway Anonyme
+# Kilo AI — Tor + Anonymous Gateway
 
-> **Cible :** `https://api.kilo.ai/api/gateway/v1` (gateway OpenAI-compatible, accès anonyme sans clé API)  
-> **Modèle (ex. observé/documenté) :** `reflection/beam-free`  
-> **Principe :** requêtes API via proxy Tor (`SOCKS5`) + rotation d’IP de sortie pour contourner les limites par IP  
-> **Statut :** documentation technique (fonctionnement, mise en œuvre, limites)
-
----
-
-## Table des matières
-
-- [Vue d’ensemble](#vue-densemble)
-- [Architecture & flux réseau](#architecture--flux-réseau)
-- [Pourquoi ça marche](#pourquoi-ça-marche)
-  - [1. Gateway sans authentification par clé](#1-gateway-sans-authentification-par-clé)
-  - [2. Contrôle d’accès/quotas principalement par IP](#2-contrôle-daccèsquotas-principalement-par-ip)
-  - [3. Tor comme plan de rotation d’IP](#3-tor-comme-plan-de-rotation-dip)
-  - [4. Compatibilité API (format chat/completions)](#4-compatibilité-api-format-chatcompletions)
-- [Mise en œuvre](#mise-en-œuvre)
-  - [Prérequis](#prérequis)
-  - [Exemple `curl` (baseline)](#exemple-curl-baseline)
-  - [Rotation d’identité Tor](#rotation-didentité-tor)
-  - [Paramètres utiles](#paramètres-utiles)
-- [Limites & contraintes](#limites--contraintes)
-  - [Limites du gateway](#limites-du-gateway)
-  - [Limites liées à Tor](#limites-liées-à-tor)
-  - [Limites d’anonymat & traçabilité](#limites-danonymat--traçabilité)
-  - [Fiabilité & reproductibilité](#fiabilité--reproductibilité)
-  - [Comportement modèle/prompt](#comportement-modèleprompt)
-- [Dépannage rapide](#dépannage-rapide)
-- [Référence rapide](#référence-rapide)
+> **Target:** `https://api.kilo.ai/api/gateway/v1` (OpenAI-compatible gateway, anonymous keyless access)  
+> **Model (documented example):** `reflection/beam-free`  
+> **Principle:** API requests routed through a Tor `SOCKS5` proxy + exit-IP rotation to work around IP-based limits  
+> **Status:** Technical documentation (how it works, setup, limitations)
 
 ---
 
-## Vue d’ensemble
+## Table of Contents
 
-Le gateway Kilo AI expose une interface de type **OpenAI Chat Completions** accessible **sans clé API** (`keyless`). Dans ce mode, le service applique typiquement des contrôles (quotas/rate limits, filtrage, disponibilité) au niveau réseau/usage plutôt que via un compte authentifié. 
-
-En routant les requêtes via **Tor** (`--socks5-hostname 127.0.0.1:9050`), le client sort avec l’IP d’un **nœud de sortie Tor**. En changeant de circuit/identité Tor, l’IP de sortie change, ce qui permet de **répartir ou réinitialiser** les limites associées à une IP source donnée.
-
-**En bref :**
-- *Accès* → gateway anonyme (pas de clé)
-- *Distribution de charge des quotas* → changement d’IP via Tor
-- *Interface* → endpoint `/chat/completions` compatible OpenAI
+- [Overview](#overview)
+- [Architecture & Network Flow](#architecture--network-flow)
+- [Why It Works](#why-it-works)
+  - [1. Keyless gateway access](#1-keyless-gateway-access)
+  - [2. Access control/quotas primarily tied to IP](#2-access-controlquotas-primarily-tied-to-ip)
+  - [3. Tor as an IP-rotation layer](#3-tor-as-an-ip-rotation-layer)
+  - [4. API compatibility (chat/completions format)](#4-api-compatibility-chatcompletions-format)
+- [Implementation](#implementation)
+  - [Prerequisites](#prerequisites)
+  - [Baseline `curl` example](#baseline-curl-example)
+  - [Tor identity rotation](#tor-identity-rotation)
+  - [Useful parameters](#useful-parameters)
+- [Limitations & Constraints](#limitations--constraints)
+  - [Gateway-side limitations](#gateway-side-limitations)
+  - [Tor-related limitations](#tor-related-limitations)
+  - [Anonymity & traceability limitations](#anonymity--traceability-limitations)
+  - [Reliability & reproducibility](#reliability--reproducibility)
+  - [Model/prompt behavior](#modelprompt-behavior)
+- [Quick Troubleshooting](#quick-troubleshooting)
+- [Quick Reference](#quick-reference)
 
 ---
 
-## Architecture & flux réseau
+## Overview
+
+The Kilo AI gateway exposes an **OpenAI Chat Completions–style** interface that can be accessed **without an API key** (*keyless*). In this mode, the service typically enforces controls (quotas/rate limits, filtering, availability) at the network/usage level rather than through an authenticated account.
+
+By routing requests through **Tor** (`--socks5-hostname 127.0.0.1:9050`), the client egresses via a **Tor exit node** IP. Changing the Tor circuit/identity yields a different exit IP, which can **distribute or reset** limits associated with a given source IP.
+
+**In short:**
+- *Access* → anonymous gateway (no key)
+- *Quota distribution* → IP changes via Tor
+- *Interface* → OpenAI-compatible `/chat/completions` endpoint
+
+---
+
+## Architecture & Network Flow
 
 ```text
 ┌──────────────┐      SOCKS5 (9050)      ┌─────────────┐      TLS/HTTPS      ┌──────────────────────────────┐
-│ Client (curl │ ──────────────────────▶ │  Tor local  │ ─────────────────▶ │  api.kilo.ai (Gateway v1)    │
-│ / app)       │   DNS via proxy (.onion │  (client)   │   IP de sortie =   │  /api/gateway/v1/...         │
-└──────────────┘   & hostname résolu)    └──────┬──────┘   exit node Tor    └──────────────┬───────────────┘
+│ Client (curl │ ──────────────────────▶ │  Local Tor  │ ─────────────────▶ │  api.kilo.ai (Gateway v1)    │
+│ / app)       │   DNS resolved via      │  client     │   source IP =      │  /api/gateway/v1/...         │
+└──────────────┘   proxy (hostname)      └──────┬──────┘   Tor exit node    └──────────────┬───────────────┘
                                                 │                                      │
-                                         [Circuit Tor]                                 ▼
+                                         [Tor circuit]                                 ▼
                                        entry → middle → exit                    ┌───────────────┐
-                                                                                │  Modèle LLM   │
-                                                                                │ (ex. beam)    │
+                                                                                │  LLM model    │
+                                                                                │ (e.g. beam)   │
                                                                                 └───────────────┘
 
-Rotation: "New Identity" / nouveau circuit  ⇒  nouvelle IP de sortie  ⇒  nouveau “compteur” côté IP
+Rotation: "New Identity" / new circuit  ⇒  new exit IP  ⇒  fresh IP-side quota bucket
 ```
 
-**Point clé :** `--socks5-hostname` (et non `--socks5`) demande au proxy de résoudre le nom d’hôte, évitant une fuite DNS locale dans ce chemin d’appel.
+**Key point:** `--socks5-hostname` (not `--socks5`) asks the proxy to resolve the hostname, avoiding local DNS leaks in this call path.
 
 ---
 
-## Pourquoi ça marche
+## Why It Works
 
-### 1. Gateway sans authentification par clé
+### 1. Keyless gateway access
 
-- L’endpoint est exposé en mode **keyless** : aucune `Authorization: Bearer <API_KEY>` n’est requise pour effectuer une requête valide.
-- Sans identité de compte forte, le service ne peut pas lier l’usage à un utilisateur authentifié ; il s’appuie donc sur des signaux disponibles (IP source, empreintes, volume, patterns, tokens de session/anti-abus éventuels côté gateway).
+- The endpoint is exposed in **keyless** mode: no `Authorization: Bearer <API_KEY>` is required for a valid request.
+- Without a strong account identity, the service cannot bind usage to an authenticated user and instead relies on available signals (source IP, fingerprints, volume, patterns, and any gateway-side session/anti-abuse tokens).
 
-**Conséquence :** la barrière d’entrée est basse (requête HTTP JSON standard).
+**Implication:** low barrier to entry (standard HTTP JSON request).
 
-### 2. Contrôle d’accès/quotas principalement par IP
+### 2. Access control/quotas primarily tied to IP
 
-- Les gateways anonymes/gratuits appliquent fréquemment des **rate limits** et quotas par **adresse IP** (requêtes/min, tokens/jour, concurrence, etc.).
-- Une IP épuisée ou limitée reçoit des erreurs/throttling ; une IP “neuve” n’a pas (encore) consommé le même budget.
+- Anonymous/free gateways commonly enforce **rate limits** and quotas per **IP address** (requests/min, tokens/day, concurrency, etc.).
+- An exhausted or throttled IP receives errors/rate-limiting; a "new" IP has not (yet) consumed the same budget.
 
-**Conséquence :** changer d’IP observable par le gateway peut restaurer la capacité d’appel.
+**Implication:** changing the IP observed by the gateway can restore request capacity.
 
-### 3. Tor comme plan de rotation d’IP
+### 3. Tor as an IP-rotation layer
 
-- Tor route le trafic via un **circuit** (garde → relais intermédiaire → nœud de sortie). Le serveur distant voit l’IP du **nœud de sortie**.
-- En demandant une **nouvelle identité/circuit**, le client obtient (généralement) un autre exit node, donc une **autre IP source** côté gateway.
-- La rotation peut être manuelle (signal/control port) ou naturelle selon la gestion des circuits.
+- Tor routes traffic through a **circuit** (guard → middle relay → exit node). The remote server sees the **exit node** IP.
+- Requesting a **new identity/circuit** generally yields a different exit node and therefore a **different source IP** from the gateway's perspective.
+- Rotation can be manual (signal/control port) or occur naturally depending on circuit management.
 
-**Conséquence :** Tor fournit un mécanisme pratique de rotation d’IP sans infrastructure propre de proxies.
+**Implication:** Tor provides a practical mechanism for IP rotation without operating your own proxy infrastructure.
 
-### 4. Compatibilité API (format chat/completions)
+### 4. API compatibility (chat/completions format)
 
-- Le gateway parle un schéma **OpenAI-compatible** (`/chat/completions`, `model`, `messages`, `max_tokens`, etc.).
-- Les clients/outils existants fonctionnent avec un simple changement de `base URL` et sans clé.
+- The gateway speaks an **OpenAI-compatible** schema (`/chat/completions`, `model`, `messages`, `max_tokens`, etc.).
+- Existing clients/tools work with a simple `base URL` change and no key.
 
-**Conséquence :** intégration immédiate (curl, SDKs compatibles, scripts).
+**Implication:** immediate integration (curl, compatible SDKs, scripts).
 
 ---
 
-## Mise en œuvre
+## Implementation
 
-### Prérequis
+### Prerequisites
 
-- **Tor** en cours d’exécution avec un proxy SOCKS5 local (par défaut `127.0.0.1:9050`).
-  - Debian/Ubuntu : `apt install tor && systemctl start tor`
-  - Vérification rapide : `ss -ltnp | grep 9050` ou `curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip`
-- **curl** (ou tout client HTTP supportant SOCKS5 + résolution distante).
-- Connectivité sortante vers les nœuds Tor et vers `api.kilo.ai`.
+- **Tor** running with a local SOCKS5 proxy (default `127.0.0.1:9050`).
+  - Debian/Ubuntu: `apt install tor && systemctl start tor`
+  - Quick check: `ss -ltnp | grep 9050` or `curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip`
+- **curl** (or any HTTP client supporting SOCKS5 with remote hostname resolution).
+- Outbound connectivity to the Tor network and to `api.kilo.ai`.
 
-### Exemple `curl` (baseline)
+### Baseline `curl` example
 
 ```bash
 curl -sS --socks5-hostname 127.0.0.1:9050 \
@@ -118,113 +118,113 @@ curl -sS --socks5-hostname 127.0.0.1:9050 \
   -d '{
     "model": "reflection/beam-free",
     "messages": [
-      {"role": "system", "content": "<PROMPT_SYSTEME>"},
-      {"role": "user", "content": "Explique brièvement ton fonctionnement."}
+      {"role": "system", "content": "<SYSTEM_PROMPT>"},
+      {"role": "user", "content": "Briefly explain how you work."}
     ],
     "max_tokens": 400,
     "reasoning_effort": "none"
   }'
 ```
 
-**Notes :**
-- Remplacer `<PROMPT_SYSTEME>` par le prompt souhaité.
-- Pour les modèles orientés “reasoning”, un réglage bas (`reasoning_effort: "none"` ou `"low"`) peut réduire la latence/verbosité de raisonnement selon le modèle.
+**Notes:**
+- Replace `<SYSTEM_PROMPT>` with the desired system prompt.
+- For reasoning-oriented models, a lower setting (`reasoning_effort: "none"` or `"low"`) can reduce reasoning verbosity/latency depending on model support.
 
-### Rotation d’identité Tor
+### Tor identity rotation
 
 ```bash
-# Si le ControlPort est activé (ex. 9051) avec cookie/auth configuré :
-# Exemple conceptuel (à adapter selon config torrc) :
+# If ControlPort is enabled (e.g. 9051) with cookie/auth configured:
+# Conceptual example (adapt to your torrc):
 #   echo -e 'AUTHENTICATE ""\r\nSIGNAL NEWNYM\r\nQUIT' | nc 127.0.0.1 9051
 
-# Alternative simple : redémarrer le service Tor (plus lent, moins discret)
+# Simple alternative: restart the Tor service (slower, less subtle)
 #   systemctl restart tor
 ```
 
-- `SIGNAL NEWNYM` demande de nouveaux circuits ; l’effet sur l’IP de sortie dépend de la disponibilité des exits et des politiques de réutilisation de circuits (pas toujours instantané/garanti à chaque appel).
-- Bon pattern : détecter `429`/erreurs de quota → attendre brièvement → nouvelle identité → retry (backoff).
+- `SIGNAL NEWNYM` requests new circuits; the effect on the exit IP depends on exit availability and circuit reuse policies (not always instantaneous or guaranteed on every attempt).
+- Good pattern: detect `429`/quota errors → brief wait → new identity → retry with backoff.
 
-### Paramètres utiles
+### Useful parameters
 
-| Paramètre | Rôle | Remarque |
+| Parameter | Role | Notes |
 |---|---|---|
-| `model` | Sélection du modèle backend | ex. `reflection/beam-free` (disponibilité variable) |
-| `messages` | Contexte/conversation (`system`, `user`, `assistant`) | format OpenAI |
-| `max_tokens` | Borne de sortie | impact latence/coût/quotas côté gateway |
-| `temperature`, `top_p` | Échantillonnage | selon support gateway/modèle |
-| `reasoning_effort` | Effort de raisonnement (si supporté) | `none`/`low` pour réponses plus directes/légères |
-| `stream` | Streaming token-par-token (si supporté) | à tester selon implémentation |
+| `model` | Selects the backend model | e.g. `reflection/beam-free` (availability may vary) |
+| `messages` | Conversation context (`system`, `user`, `assistant`) | OpenAI format |
+| `max_tokens` | Output cap | affects latency and gateway-side quotas |
+| `temperature`, `top_p` | Sampling controls | subject to gateway/model support |
+| `reasoning_effort` | Reasoning effort (if supported) | `none`/`low` for more direct/lightweight responses |
+| `stream` | Token-by-token streaming (if supported) | verify per implementation |
 
 ---
 
-## Limites & contraintes
+## Limitations & Constraints
 
-### Limites du gateway
+### Gateway-side limitations
 
-| Limite | Détail |
+| Limitation | Details |
 |---|---|
-| **Rate limits / quotas** | Par IP, par fenêtre temporelle, par volume de tokens, ou par concurrence ; peuvent persister malgré rotation (quotas globaux, heuristiques). |
-| **Disponibilité modèle** | Modèles `*-free`/anonymes pouvant être retirés, renommés, saturés ou dégradés sans préavis. |
-| **Changements d’API** | Endpoint, schéma, champs acceptés ou politiques pouvant évoluer (breaking changes). |
-| **Filtrage côté gateway** | Blocage de prompts/réponses, modération, ou refus selon politiques du fournisseur/gateway, indépendamment du prompt système. |
-| **Pas de SLA** | Service best-effort : pas de garantie d’uptime, de latence ni de capacité. |
+| **Rate limits / quotas** | Per IP, per time window, per token volume, or by concurrency; may persist despite rotation (global quotas, heuristics). |
+| **Model availability** | Anonymous/`*-free` models may be removed, renamed, saturated, or degraded without notice. |
+| **API changes** | Endpoint, schema, accepted fields, or policies may evolve (breaking changes). |
+| **Gateway-side filtering** | Prompt/response blocking, moderation, or refusals may be enforced by the provider/gateway regardless of the system prompt. |
+| **No SLA** | Best-effort service: no guarantees on uptime, latency, or capacity. |
 
-### Limites liées à Tor
+### Tor-related limitations
 
-| Limite | Détail |
+| Limitation | Details |
 |---|---|
-| **Latence & débit** | Circuits multi-sauts ⇒ RTT élevé, throughput réduit, streaming moins fluide. |
-| **Stabilité** | Circuits pouvant se rompre ; timeouts/retries nécessaires. |
-| **Blocage des exits** | Certains services bloquent ou challengent les IP de sortie Tor (CAPTCHA, 403/429, listes de réputation). |
-| **Qualité variable des exits** | IPs déjà “brûlées”/rate-limitées par d’autres usages. |
-| **Résolution DNS** | Utiliser `--socks5-hostname` pour éviter les fuites DNS ; mauvaise config = exposition hors tunnel. |
+| **Latency & throughput** | Multi-hop circuits ⇒ higher RTT, lower throughput, less smooth streaming. |
+| **Stability** | Circuits can break; timeouts and retries are necessary. |
+| **Exit blocking** | Some services block or challenge Tor exit IPs (CAPTCHAs, 403/429, reputation lists). |
+| **Variable exit quality** | Exits may already be "burned"/rate-limited by other usage. |
+| **DNS resolution** | Use `--socks5-hostname` to avoid local DNS leaks; misconfiguration can expose traffic outside the tunnel path. |
 
-### Limites d’anonymat & traçabilité
+### Anonymity & traceability limitations
 
-| Limite | Détail |
+| Limitation | Details |
 |---|---|
-| **Anonymat ≠ invulnérabilité** | Tor réduit l’exposition de l’IP client mais n’anonymise pas le contenu, les identifiants applicatifs, ni les patterns d’usage. |
-| **Corrélation & fingerprinting** | Horodatage, volume, style, en-têtes, fingerprint TLS/HTTP, et corrélation trafic entrée/sortie peuvent réduire l’anonymat. |
-| **Métadonnées applicatives** | Comptes, cookies, tokens ou identifiants réutilisés côté client annulent les bénéfices réseau. |
-| **Point de sortie visible** | Le gateway voit l’IP exit (et ses opérateurs/logs éventuels) ; le trafic entre exit et destination dépend du TLS mais la terminaison/observation côté service reste possible. |
-| **Juridique/conformité** | Le cadre légal, les CGU du service et les lois applicables restent en vigueur quel que soit le transport. |
+| **Anonymity ≠ invulnerability** | Tor reduces client-IP exposure but does not anonymize content, application identifiers, or usage patterns. |
+| **Correlation & fingerprinting** | Timing, volume, style, headers, TLS/HTTP fingerprinting, and entry/exit traffic correlation can reduce anonymity. |
+| **Application metadata** | Reused accounts, cookies, tokens, or client-side identifiers negate network-layer benefits. |
+| **Visible egress point** | The gateway sees the exit IP (and any operator logs); traffic between exit and destination depends on TLS, but observation/termination at the service remains possible. |
+| **Legal/compliance context** | Applicable laws and service terms remain in force regardless of transport. |
 
-### Fiabilité & reproductibilité
+### Reliability & reproducibility
 
-- Réponses **non déterministes** (température, versions modèle, charge) : difficile de garantir la même sortie.
-- Rotation d’IP ≠ réinitialisation garantie (délai `NEWNYM`, réutilisation d’exits, limites non-IP).
-- Dépendance à une infra tierce non contractuelle : possibilité d’interruption à tout moment.
+- **Non-deterministic outputs** (temperature, model versions, load): identical responses are not guaranteed.
+- IP rotation ≠ guaranteed reset (NEWNYM delay, exit reuse, non-IP limits).
+- Dependence on third-party, non-contractual infrastructure: service may be interrupted at any time.
 
-### Comportement modèle/prompt
+### Model/prompt behavior
 
-- Le **prompt système** influence fortement le comportement mais ne garantit pas l’absence de refus/filtrage si le gateway ou le modèle impose ses propres politiques.
-- `reasoning_effort` (quand supporté) ajuste le style/effort de raisonnement, pas la disponibilité du service.
-- Les capacités réelles dépendent du modèle exposé derrière l’alias (contexte, outils, multimodalité, fraîcheur des données).
+- The **system prompt** strongly influences behavior but does not guarantee absence of refusals/filtering if the gateway or model enforces its own policies.
+- `reasoning_effort` (when supported) adjusts reasoning style/effort, not service availability.
+- Actual capabilities depend on the model exposed behind the alias (context window, tools, multimodality, data freshness).
 
 ---
 
-## Dépannage rapide
+## Quick Troubleshooting
 
-| Symptôme | Piste |
+| Symptom | Likely cause / fix |
 |---|---|
-| `Connection refused` sur `127.0.0.1:9050` | Tor non démarré / port SOCKS différent |
-| Timeout / très lent | Circuit Tor dégradé, exit saturé ; retenter ou renouveler le circuit |
-| `429` / rate limited | Attendre, renouveler l’identité Tor, réduire le débit/taille des requêtes |
-| `403` / bloqué | Exit Tor blacklisté ; changer de circuit/IP |
-| `404` sur la racine `/v1` | Normal si le chemin exact attendu est `/chat/completions` (ou autre route) |
-| Réponse vide / erreur JSON | Vérifier `model`, schéma `messages`, `max_tokens`, et support des paramètres |
+| `Connection refused` on `127.0.0.1:9050` | Tor not running / different SOCKS port |
+| Timeout / very slow | Degraded Tor circuit or saturated exit; retry or renew circuit |
+| `429` / rate limited | Wait, renew Tor identity, reduce request rate/size |
+| `403` / blocked | Tor exit blacklisted; change circuit/IP |
+| `404` on base `/v1` path | Expected if the correct route is `/chat/completions` (or another path) |
+| Empty / JSON error response | Check `model`, `messages` schema, `max_tokens`, and parameter support |
 
 ---
 
-## Référence rapide
+## Quick Reference
 
-- **Base URL (gateway v1) :** `https://api.kilo.ai/api/gateway/v1`
-- **Endpoint chat :** `POST /chat/completions`
-- **Auth :** aucune clé requise (mode anonyme)
-- **Transport recommandé :** `curl --socks5-hostname 127.0.0.1:9050 ...`
-- **Modèle (ex.) :** `reflection/beam-free`
-- **Levier de déblocage quota IP :** rotation d’identité/circuit Tor
+- **Base URL (gateway v1):** `https://api.kilo.ai/api/gateway/v1`
+- **Chat endpoint:** `POST /chat/completions`
+- **Auth:** no key required (anonymous mode)
+- **Recommended transport:** `curl --socks5-hostname 127.0.0.1:9050 ...`
+- **Model (example):** `reflection/beam-free`
+- **IP-quota relief lever:** Tor identity/circuit rotation
 
 ---
 
-*Document de référence technique — comportement observé/supposé du mode anonyme Kilo AI via Tor, sujet à évolution.*
+*Technical reference — observed/expected behavior of Kilo AI anonymous gateway access via Tor; subject to change.*
