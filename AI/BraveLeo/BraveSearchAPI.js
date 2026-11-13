@@ -18,9 +18,10 @@
  *                                    predicate, context, context_urls, context_results } }
  *
  * Gaps / notes:
- * - Conversation initiation trigger was not fully isolated in capture. This proxy can
- *   (a) consume a known `conversation` id, or (b) best-effort resolve one from a Brave
- *   Search results page for a query (heuristic; may require browser-like cookies/session).
+ * - Exact conversation initiation trigger was not fully isolated in capture. This proxy can:
+ *   (a) consume a known `conversation` id, or
+ *   (b) best-effort resolve one from Brave Search pages for a query (heuristic; cookies/session
+ *       and browser-like environment may be required for Brave to emit a conversation-backed answer).
  * - Unofficial, versioned interface. Use responsibly and per applicable terms/law.
  */
 
@@ -61,6 +62,45 @@ function assertFetch(fetchImpl) {
   return fetchImpl;
 }
 
+function sleep(ms, signal) {
+  if (!ms || ms <= 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(resolve, ms);
+    if (signal) {
+      if (signal.aborted) {
+        clearTimeout(t);
+        return reject(signal.reason || new Error("aborted"));
+      }
+      signal.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(t);
+          reject(signal.reason || new Error("aborted"));
+        },
+        { once: true }
+      );
+    }
+  });
+}
+
+function withTimeout(signal, timeoutMs) {
+  if (!timeoutMs || timeoutMs <= 0) return { signal, cleanup: () => {} };
+  const ctrl = new AbortController();
+  const onAbort = () => ctrl.abort(signal && signal.reason);
+  if (signal) {
+    if (signal.aborted) ctrl.abort(signal.reason);
+    else signal.addEventListener("abort", onAbort, { once: true });
+  }
+  const t = setTimeout(() => ctrl.abort(new Error(`timeout after ${timeoutMs}ms`)), timeoutMs);
+  return {
+    signal: ctrl.signal,
+    cleanup: () => {
+      clearTimeout(t);
+      if (signal) signal.removeEventListener("abort", onAbort);
+    },
+  };
+}
+
 function normalizeConversationId(id) {
   if (id == null) return null;
   const s = String(id).trim();
@@ -75,15 +115,19 @@ function extractConversationId(text) {
   const s = String(text);
   const patterns = [
     /[?&]conversation=([a-f0-9]{16,64})/i,
-    /["']conversation["']\s*[:=]\s*["']([a-f0-9]{16,64})["']/i,
-    /data-conversation=["']([a-f0-9]{16,64})["']/i,
     /\\u0026conversation=([a-f0-9]{16,64})/i,
+    /["']conversation["']\s*[:=]\s*["']([a-f0-9]{16,64})["']/i,
+    /["']conversation_id["']\s*[:=]\s*["']([a-f0-9]{16,64})["']/i,
+    /["']conversationId["']\s*[:=]\s*["']([a-f0-9]{16,64})["']/i,
+    /data-conversation=["']([a-f0-9]{16,64})["']/i,
   ];
   for (const re of patterns) {
     const m = s.match(re);
     if (m) return m[1];
   }
-  return null;
+  // Fallback: look for 32-hex tokens near the word "conversation" in JSON-ish blobs
+  const near = s.match(/conversation[^a-f0-9]{0,20}([a-f0-9]{32})/i);
+  return near ? near[1] : null;
 }
 
 function headersToObject(headers) {
@@ -112,7 +156,7 @@ function mergeHeaders(...parts) {
     const obj = typeof p.forEach === "function" || p.entries ? headersToObject(p) : p;
     for (const [k, v] of Object.entries(obj)) {
       if (v === undefined || v === null) continue;
-      out[String(k).toLowerCase()] = v;
+      out[String(k).toLowerCase()] = String(v);
     }
   }
   return out;
@@ -123,7 +167,8 @@ class CookieJar {
   constructor(initial) {
     this.map = new Map();
     if (typeof initial === "string" && initial.trim()) this.addCookieHeader(initial);
-    else if (initial && typeof initial === "object") {
+    else if (initial instanceof CookieJar) this.addCookieHeader(initial.toString());
+    else if (initial && typeof initial === "object" && !Array.isArray(initial)) {
       for (const [k, v] of Object.entries(initial)) this.map.set(k, String(v));
     }
   }
@@ -142,7 +187,8 @@ class CookieJar {
   }
   ingestResponse(res) {
     try {
-      // Node/undici: getSetCookie(); browsers may expose only combined header.
+      if (!res || !res.headers) return;
+      // Node/undici: getSetCookie(); browsers may expose only a combined header.
       if (typeof res.headers.getSetCookie === "function") {
         this.addSetCookie(res.headers.getSetCookie());
       } else {
@@ -152,10 +198,12 @@ class CookieJar {
     } catch (_) {}
   }
   addCookieHeader(cookieHeader) {
-    for (const part of String(cookieHeader).split(";")) {
+    for (const part of String(cookieHeader || "").split(";")) {
       const idx = part.indexOf("=");
       if (idx <= 0) continue;
-      this.map.set(part.slice(0, idx).trim(), part.slice(idx + 1).trim());
+      const name = part.slice(0, idx).trim();
+      const value = part.slice(idx + 1).trim();
+      if (name) this.map.set(name, value);
     }
   }
   toString() {
@@ -166,6 +214,9 @@ class CookieJar {
   }
   get size() {
     return this.map.size;
+  }
+  clone() {
+    return new CookieJar(this.toString());
   }
 }
 
@@ -179,6 +230,13 @@ function buildSearchUrl(query, opts = {}) {
       if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
     }
   }
+  return url.toString();
+}
+
+function buildAskUrl(query, opts = {}) {
+  const url = new URL("/ask", BRAVE_ORIGIN);
+  url.searchParams.set("q", String(query ?? ""));
+  if (opts.source) url.searchParams.set("source", String(opts.source));
   return url.toString();
 }
 
@@ -203,51 +261,66 @@ function buildWithAskUrl(conversation, enableInlineEntities = true) {
 
 /**
  * Best-effort: resolve a Brave chatllm conversation id for a query.
- * Tries the search page and extracts `conversation=<id>` from the final URL or HTML.
- * Heuristic (initiation not fully captured); pass cookies/session for better odds.
+ * Tries Brave search/ask pages and extracts `conversation=<id>` from final URL or HTML.
+ * Heuristic (initiation not fully captured); cookies/session improve odds.
  */
 async function resolveConversation(query, opts = {}) {
   const fetchImpl = assertFetch(opts.fetchImpl || globalThis.fetch);
   if (!query || !String(query).trim()) throw new Error("query is required");
 
   const jar = opts.cookieJar instanceof CookieJar ? opts.cookieJar : new CookieJar(opts.cookies);
-  const strategies = [
-    { extraParams: null }, // plain search
-    // speculative hints sometimes used by AI-answer surfaces (best-effort, harmless if ignored)
-    { extraParams: { summary: "1" } },
+  const source = opts.source || "web";
+
+  const candidates = [
+    { name: "search", url: buildSearchUrl(query, { source }) },
+    { name: "search+summary", url: buildSearchUrl(query, { source, extraParams: { summary: "1" } }) },
+    { name: "ask", url: buildAskUrl(query, { source: "web" }) },
   ];
 
   let last = null;
-  for (const strat of strategies) {
-    const url = buildSearchUrl(query, { source: opts.source || "web", extraParams: strat.extraParams });
-    const headers = mergeHeaders(NAVIGATE_HEADERS, opts.headers, jar.toString() ? { cookie: jar.toString() } : null);
-
-    const res = await fetchImpl(url, {
-      method: "GET",
-      headers,
-      redirect: "follow",
-      signal: opts.signal,
-    });
-    jar.ingestResponse(res);
-
-    const finalUrl = res.url || url;
-    let conversation = extractConversationId(finalUrl);
-    let html = "";
+  for (const cand of candidates) {
+    const t = withTimeout(opts.signal, opts.timeoutMs);
     try {
-      html = await res.text();
-    } catch (_) {
-      html = "";
-    }
-    if (!conversation && html) conversation = extractConversationId(html);
+      const headers = mergeHeaders(NAVIGATE_HEADERS, opts.headers, jar.toString() ? { cookie: jar.toString() } : null);
+      const res = await fetchImpl(cand.url, {
+        method: "GET",
+        headers,
+        redirect: "follow",
+        signal: t.signal,
+      });
+      jar.ingestResponse(res);
 
-    last = {
-      conversation: conversation || null,
-      finalUrl,
-      status: res.status,
-      strategy: strat.extraParams ? "search+params" : "search",
-      cookies: jar.toString() || null,
-    };
-    if (conversation) return last;
+      const finalUrl = res.url || cand.url;
+      let conversation = extractConversationId(finalUrl);
+      let html = "";
+      try {
+        html = await res.text();
+      } catch (_) {
+        html = "";
+      }
+      if (!conversation && html) conversation = extractConversationId(html);
+
+      last = {
+        conversation: conversation || null,
+        finalUrl,
+        status: res.status,
+        strategy: cand.name,
+        cookies: jar.toString() || null,
+      };
+      if (conversation) return last;
+    } catch (e) {
+      last = {
+        conversation: null,
+        finalUrl: cand.url,
+        status: null,
+        strategy: cand.name,
+        error: e && e.message ? e.message : String(e),
+        cookies: jar.toString() || null,
+      };
+      // continue to next candidate on failure/timeout
+    } finally {
+      t.cleanup();
+    }
   }
 
   return last || { conversation: null, finalUrl: null, status: null, strategy: null, cookies: jar.toString() || null };
@@ -263,24 +336,26 @@ async function safeReadText(res) {
   }
 }
 
-/**
- * Parse Brave `x-stream-format: tap` body (line-delimited JSON event objects).
- * Tolerant of blank lines, `data:` prefixes, and non-JSON lines.
- */
+function parseLine(line) {
+  const trimmed = String(line || "").trim();
+  if (!trimmed) return null;
+  const payload = trimmed.startsWith("data:") ? trimmed.slice(5).trim() : trimmed;
+  if (!payload || payload === "[DONE]") return null;
+  try {
+    return JSON.parse(payload);
+  } catch (_) {
+    return { type: "unparsed", raw: payload };
+  }
+}
+
+/** Parse Brave `x-stream-format: tap` body (line-delimited JSON event objects). */
 function parseEventStream(body) {
   const events = [];
   const text = String(body || "");
   const lines = text.split(/\r?\n/);
   for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    const payload = trimmed.startsWith("data:") ? trimmed.slice(5).trim() : trimmed;
-    if (!payload || payload === "[DONE]") continue;
-    try {
-      events.push(JSON.parse(payload));
-    } catch (_) {
-      events.push({ type: "unparsed", raw: payload });
-    }
+    const ev = parseLine(line);
+    if (ev) events.push(ev);
   }
   return events;
 }
@@ -299,7 +374,12 @@ function applyEvent(state, ev) {
       state.stopped = true;
       break;
     case "usage":
-      state.usage = ev;
+      state.usage = {
+        prompt_tokens: ev.prompt_tokens ?? null,
+        completion_tokens: ev.completion_tokens ?? null,
+        reasoning_tokens: ev.reasoning_tokens ?? null,
+        raw: ev,
+      };
       break;
     case "followups":
       state.followups = Array.isArray(ev.followups) ? ev.followups : [];
@@ -310,6 +390,64 @@ function applyEvent(state, ev) {
     default:
       break;
   }
+}
+
+function uniqStrings(items) {
+  const out = [];
+  const seen = new Set();
+  for (const it of items || []) {
+    let key;
+    if (typeof it === "string") key = it;
+    else if (it && typeof it === "object") key = it.url || it.link || it.href || JSON.stringify(it);
+    else key = String(it);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(it);
+  }
+  return out;
+}
+
+function extractSources(enrichments) {
+  if (!enrichments || typeof enrichments !== "object") {
+    return {
+      references: [],
+      urls: [],
+      reference_urls: [],
+      context_urls: [],
+      context: [],
+      context_results: [],
+      images: [],
+      qa: [],
+      entities: [],
+      main_entity: null,
+      main_entity_infobox: null,
+      all_urls: [],
+    };
+  }
+  const arr = (v) => (Array.isArray(v) ? v : []);
+  const references = arr(enrichments.references);
+  const urls = arr(enrichments.urls);
+  const reference_urls = arr(enrichments.reference_urls);
+  const context_urls = arr(enrichments.context_urls);
+  const urlLike = (x) => (typeof x === "string" ? x : x && (x.url || x.link || x.href));
+  const all_urls = uniqStrings(
+    [...urls, ...reference_urls, ...context_urls, ...references.map(urlLike)].filter(Boolean)
+  );
+  return {
+    references,
+    urls,
+    reference_urls,
+    context_urls,
+    context: arr(enrichments.context),
+    context_results: arr(enrichments.context_results),
+    images: arr(enrichments.images),
+    qa: arr(enrichments.qa),
+    entities: arr(enrichments.entities),
+    main_entity: enrichments.main_entity ?? null,
+    main_entity_infobox: enrichments.main_entity_infobox ?? null,
+    predicate: enrichments.predicate ?? null,
+    all_urls,
+  };
 }
 
 function finalizeState(state) {
@@ -326,25 +464,8 @@ function finalizeState(state) {
     followups: state.followups || [],
     enrichments,
     sources: extractSources(enrichments),
-  };
-}
-
-function extractSources(enrichments) {
-  if (!enrichments || typeof enrichments !== "object") {
-    return { references: [], urls: [], reference_urls: [], context_urls: [], images: [], entities: [], context_results: [] };
-  }
-  const arr = (v) => (Array.isArray(v) ? v : []);
-  return {
-    references: arr(enrichments.references),
-    urls: arr(enrichments.urls),
-    reference_urls: arr(enrichments.reference_urls),
-    context_urls: arr(enrichments.context_urls),
-    images: arr(enrichments.images),
-    entities: arr(enrichments.entities),
-    context: arr(enrichments.context),
-    context_results: arr(enrichments.context_results),
-    main_entity: enrichments.main_entity ?? null,
-    main_entity_infobox: enrichments.main_entity_infobox ?? null,
+    started: !!state.started,
+    stopped: !!state.stopped,
   };
 }
 
@@ -355,80 +476,58 @@ function reduceEvents(events) {
   return finalizeState(state);
 }
 
-async function* iterateNdjsonStream(response, onEvent) {
+async function* iterateNdjsonStream(response) {
   const body = response && response.body;
   if (!body) return;
   const decoder = new TextDecoder();
   let buffer = "";
 
-  // Web ReadableStream (Node 18+ / browsers)
+  const feed = function* (chunkText) {
+    buffer += chunkText;
+    let idx;
+    while ((idx = buffer.search(/\r?\n/)) !== -1) {
+      const nl = buffer[idx] === "\r" && buffer[idx + 1] === "\n" ? 2 : 1;
+      const line = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + nl);
+      const ev = parseLine(line);
+      if (ev) yield ev;
+    }
+  };
+
   if (typeof body.getReader === "function") {
     const reader = body.getReader();
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let idx;
-      while ((idx = buffer.search(/\r?\n/)) !== -1) {
-        const line = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + (buffer[idx] === "\r" && buffer[idx + 1] === "\n" ? 2 : 1));
-        const ev = parseLine(line);
-        if (!ev) continue;
-        if (onEvent) try { onEvent(ev); } catch (_) {}
-        yield ev;
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        yield* feed(decoder.decode(value, { stream: true }));
       }
+      yield* feed(decoder.decode());
+    } finally {
+      try { reader.releaseLock(); } catch (_) {}
     }
-    buffer += decoder.decode();
   } else if (typeof body[Symbol.asyncIterator] === "function") {
-    // Node stream async iterable
     for await (const chunk of body) {
-      buffer += typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
-      let idx;
-      while ((idx = buffer.search(/\r?\n/)) !== -1) {
-        const line = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + (buffer[idx] === "\r" && buffer[idx + 1] === "\n" ? 2 : 1));
-        const ev = parseLine(line);
-        if (!ev) continue;
-        if (onEvent) try { onEvent(ev); } catch (_) {}
-        yield ev;
-      }
+      yield* feed(typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true }));
     }
+    yield* feed(decoder.decode());
   } else {
     const text = await safeReadText(response);
-    for (const ev of parseEventStream(text)) {
-      if (onEvent) try { onEvent(ev); } catch (_) {}
-      yield ev;
-    }
+    for (const ev of parseEventStream(text)) yield ev;
     return;
   }
 
   if (buffer.trim()) {
     const ev = parseLine(buffer);
-    if (ev) {
-      if (onEvent) try { onEvent(ev); } catch (_) {}
-      yield ev;
-    }
+    if (ev) yield ev;
   }
 }
 
-function parseLine(line) {
-  const trimmed = String(line || "").trim();
-  if (!trimmed) return null;
-  const payload = trimmed.startsWith("data:") ? trimmed.slice(5).trim() : trimmed;
-  if (!payload || payload === "[DONE]") return null;
-  try {
-    return JSON.parse(payload);
-  } catch (_) {
-    return { type: "unparsed", raw: payload };
-  }
+function isRetryableStatus(status) {
+  return status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599);
 }
 
-/**
- * Fetch and consume the `with_ask` stream for a conversation.
- * If `incremental` is true, reads via streaming reader and emits `onEvent` live;
- * otherwise buffers the full body then parses.
- */
-async function streamWithAsk(conversation, opts = {}) {
+async function streamWithAskOnce(conversation, opts = {}) {
   const fetchImpl = assertFetch(opts.fetchImpl || globalThis.fetch);
   const conv = normalizeConversationId(conversation) || String(conversation || "").trim();
   if (!conv) throw new Error("conversation id is required");
@@ -442,62 +541,133 @@ async function streamWithAsk(conversation, opts = {}) {
     opts.headers
   );
 
-  const res = await fetchImpl(url, { method: "GET", headers, signal: opts.signal });
-  jar.ingestResponse(res);
+  const t = withTimeout(opts.signal, opts.timeoutMs);
+  try {
+    const res = await fetchImpl(url, { method: "GET", headers, signal: t.signal });
+    jar.ingestResponse(res);
 
-  const resHeaders = headersToObject(res.headers);
-  if (!res.ok) {
-    const bodyText = await safeReadText(res);
-    const err = new Error(`with_ask request failed: ${res.status} ${res.statusText || ""}`.trim());
-    err.status = res.status;
-    err.headers = resHeaders;
-    err.body = bodyText;
-    err.conversation = conv;
-    throw err;
-  }
-
-  const state = { deltaText: "", stopText: null, usage: null, followups: [], enrichments: null, started: false, stopped: false };
-  const events = [];
-  const onEvent = typeof opts.onEvent === "function" ? opts.onEvent : null;
-  const wantIncremental = opts.incremental !== false && !!res.body; // default: stream-read when possible
-
-  if (wantIncremental) {
-    for await (const ev of iterateNdjsonStream(res, null)) {
-      events.push(ev);
-      applyEvent(state, ev);
-      if (onEvent) try { onEvent(ev, { ...finalizeState(state), partial: true }); } catch (_) {}
+    const resHeaders = headersToObject(res.headers);
+    if (!res.ok) {
+      const bodyText = await safeReadText(res);
+      const err = new Error(`with_ask request failed: ${res.status} ${res.statusText || ""}`.trim());
+      err.status = res.status;
+      err.headers = resHeaders;
+      err.body = bodyText;
+      err.conversation = conv;
+      err.retryable = isRetryableStatus(res.status);
+      throw err;
     }
-  } else {
-    const bodyText = await safeReadText(res);
-    const parsed = parseEventStream(bodyText);
-    for (const ev of parsed) {
-      events.push(ev);
-      applyEvent(state, ev);
-      if (onEvent) try { onEvent(ev, { ...finalizeState(state), partial: true }); } catch (_) {}
+
+    const state = { deltaText: "", stopText: null, usage: null, followups: [], enrichments: null, started: false, stopped: false };
+    const events = [];
+    const includeEvents = opts.includeEvents !== false;
+    const onEvent = typeof opts.onEvent === "function" ? opts.onEvent : null;
+    const incremental = opts.incremental !== false && !!res.body;
+
+    const consume = async (iter) => {
+      for await (const ev of iter) {
+        if (includeEvents) events.push(ev);
+        applyEvent(state, ev);
+        if (onEvent) {
+          try { onEvent(ev, { ...finalizeState(state), partial: true, conversation: conv }); } catch (_) {}
+        }
+      }
+    };
+
+    if (incremental) {
+      await consume(iterateNdjsonStream(res));
+    } else {
+      const bodyText = await safeReadText(res);
+      await consume((async function* () { for (const ev of parseEventStream(bodyText)) yield ev; })());
+    }
+
+    const reduced = finalizeState(state);
+    return {
+      ok: true,
+      conversation: conv,
+      answer: reduced.answer,
+      text: reduced.text,
+      usage: reduced.usage,
+      followups: reduced.followups,
+      enrichments: reduced.enrichments,
+      sources: reduced.sources,
+      events: includeEvents ? events : undefined,
+      status: res.status,
+      headers: resHeaders,
+      contentType: (resHeaders["content-type"] || "").toLowerCase(),
+      streamFormat: resHeaders["x-stream-format"] || null,
+      cookies: jar.toString() || null,
+    };
+  } finally {
+    t.cleanup();
+  }
+}
+
+/**
+ * Fetch and consume the `with_ask` stream for a conversation (with optional retries).
+ */
+async function streamWithAsk(conversation, opts = {}) {
+  const retries = Math.max(0, Number(opts.retries ?? 0) || 0);
+  let attempt = 0;
+  let lastErr;
+  while (attempt <= retries) {
+    try {
+      return await streamWithAskOnce(conversation, opts);
+    } catch (e) {
+      lastErr = e;
+      const retryable = e && (e.retryable || e.name === "AbortError" ? false : isRetryableStatus(e.status));
+      if (attempt >= retries || !retryable || (opts.signal && opts.signal.aborted)) throw e;
+      const backoff = Math.min(2000 * Math.pow(2, attempt), 8000);
+      await sleep(backoff, opts.signal);
+      attempt++;
     }
   }
+  throw lastErr;
+}
 
-  const reduced = finalizeState(state);
-  return {
-    ok: true,
-    conversation: conv,
-    answer: reduced.answer,
-    text: reduced.text,
-    usage: reduced.usage,
-    followups: reduced.followups,
-    enrichments: reduced.enrichments,
-    sources: reduced.sources,
-    events,
-    status: res.status,
-    headers: resHeaders,
-    contentType: (resHeaders["content-type"] || "").toLowerCase(),
-    streamFormat: resHeaders["x-stream-format"] || null,
-  };
+/**
+ * Async generator: yields each stream event, then returns/finalizes with reduced result.
+ * Usage: for await (const ev of braveLeoStream(...)) { ... }  (collect via helper) or
+ *        const gen = braveLeoStream(...); for await (const ev of gen) ... not directly returning final,
+ * so prefer `braveLeoSearch` with `onEvent`, or use this with a collector:
+ */
+async function* braveLeoEventStream(conversation, opts = {}) {
+  // Implement as incremental pass-through by tapping onEvent-like collection.
+  const queue = [];
+  let done = false;
+  let final = null;
+  let err = null;
+  let notify;
+  const wake = () => { if (notify) { const n = notify; notify = null; n(); } };
+
+  const p = streamWithAsk(conversation, {
+    ...opts,
+    incremental: true,
+    onEvent: (ev, partial) => {
+      queue.push({ event: ev, partial });
+      wake();
+      if (opts.onEvent) try { opts.onEvent(ev, partial); } catch (_) {}
+    },
+  })
+    .then((r) => { final = r; })
+    .catch((e) => { err = e; })
+    .finally(() => { done = true; wake(); });
+
+  while (!done || queue.length) {
+    if (queue.length) {
+      yield queue.shift();
+      continue;
+    }
+    await new Promise((r) => { notify = r; });
+  }
+  await p.catch(() => {});
+  if (err) throw err;
+  return final;
 }
 
 // --- High-level tool/agent API ---
 
-function buildAgentResult({ ok, query, conversation, resolution, stream, error }) {
+function buildAgentResult({ ok, query, conversation, resolution, stream, error, includeEvents = true }) {
   if (!ok) {
     return {
       ok: false,
@@ -513,7 +683,7 @@ function buildAgentResult({ ok, query, conversation, resolution, stream, error }
       resolution: resolution || null,
     };
   }
-  return {
+  const result = {
     ok: true,
     query: query || null,
     conversation: stream.conversation,
@@ -523,21 +693,60 @@ function buildAgentResult({ ok, query, conversation, resolution, stream, error }
     followups: stream.followups,
     enrichments: stream.enrichments,
     sources: stream.sources,
-    events: stream.events,
     meta: {
       status: stream.status,
       contentType: stream.contentType,
       streamFormat: stream.streamFormat,
       resolution: resolution || null,
+      cookies: stream.cookies || null,
     },
   };
+  if (includeEvents && stream.events) result.events = stream.events;
+  return result;
+}
+
+/** Compact result for LLM/tool context (drops raw events/headers, keeps essentials). */
+function compactResult(result, opts = {}) {
+  if (!result || typeof result !== "object") return result;
+  const maxSources = Number.isFinite(opts.maxSources) ? opts.maxSources : 10;
+  const maxFollowups = Number.isFinite(opts.maxFollowups) ? opts.maxFollowups : 5;
+  const src = result.sources || extractSources(result.enrichments);
+  const sourceUrls = uniqStrings([...(src.all_urls || []), ...(src.references || []), ...(src.urls || []), ...(src.reference_urls || [])])
+    .slice(0, maxSources);
+  const compact = {
+    ok: !!result.ok,
+    query: result.query || null,
+    conversation: result.conversation || null,
+    answer: result.answer || result.text || "",
+    followups: Array.isArray(result.followups) ? result.followups.slice(0, maxFollowups) : [],
+    sources: sourceUrls,
+    usage: result.usage || null,
+  };
+  if (!result.ok) compact.error = result.error || "Unknown error";
+  if (src.main_entity) compact.main_entity = src.main_entity;
+  return compact;
+}
+
+/** Format a result as concise text for agent consumption. */
+function formatResultAsText(result, opts = {}) {
+  if (!result) return "";
+  if (!result.ok) return `Error: ${result.error || "request failed"}`;
+  const parts = [];
+  if (result.answer) parts.push(String(result.answer));
+  const compact = compactResult(result, opts);
+  if (compact.sources && compact.sources.length) {
+    parts.push("\nSources:\n" + compact.sources.map((s, i) => `${i + 1}. ${typeof s === "string" ? s : JSON.stringify(s)}`).join("\n"));
+  }
+  if (compact.followups && compact.followups.length) {
+    parts.push("\nFollow-ups:\n" + compact.followups.map((f) => `- ${typeof f === "string" ? f : JSON.stringify(f)}`).join("\n"));
+  }
+  return parts.join("\n");
 }
 
 /**
- * Get a Brave Leo / Answer with AI web-grounded answer.
- *
- * - If `conversation` is provided, streams that conversation directly.
- * - Otherwise best-effort resolves a conversation id from Brave Search for `query`.
+ * High-level: get a Brave Leo / Answer with AI web-grounded answer.
+ * - If `conversation` provided: streams it directly.
+ * - Else: best-effort resolves a conversation id from Brave Search for `query`.
  */
 async function braveLeoSearch(input = {}) {
   const {
@@ -550,10 +759,13 @@ async function braveLeoSearch(input = {}) {
     onEvent,
     incremental = true,
     cookies,
+    includeEvents = true,
+    timeoutMs,
+    retries = 0,
   } = input;
 
   let conversation = normalizeConversationId(input.conversation) || (input.conversation ? String(input.conversation).trim() : null);
-  const jar = new CookieJar(cookies);
+  const jar = input.cookieJar instanceof CookieJar ? input.cookieJar : new CookieJar(cookies);
   let resolution = null;
 
   try {
@@ -561,12 +773,19 @@ async function braveLeoSearch(input = {}) {
       if (!query || !String(query).trim()) {
         throw new Error("Either 'conversation' or 'query' must be provided");
       }
-      resolution = await resolveConversation(query, { source, fetchImpl, headers, signal, cookieJar: jar });
+      resolution = await resolveConversation(query, {
+        source,
+        fetchImpl,
+        headers,
+        signal,
+        cookieJar: jar,
+        timeoutMs,
+      });
       conversation = normalizeConversationId(resolution.conversation);
     }
 
     if (!conversation) {
-      return buildAgentResult({
+      const res = buildAgentResult({
         ok: false,
         query,
         conversation: null,
@@ -576,6 +795,8 @@ async function braveLeoSearch(input = {}) {
           "Conversation initiation was not fully captured; provide a known 'conversation' id, " +
           "or pass browser/session cookies in an environment where Brave Search returns a conversation-backed answer.",
       });
+      res.meta = { resolution, cookies: jar.toString() || null };
+      return res;
     }
 
     const referer = query
@@ -591,15 +812,14 @@ async function braveLeoSearch(input = {}) {
       onEvent,
       incremental,
       cookieJar: jar,
+      includeEvents,
+      timeoutMs,
+      retries,
     });
 
-    // attach cookie state for callers that want session continuity
-    stream.cookies = jar.toString() || null;
-    const result = buildAgentResult({ ok: true, query, conversation, resolution, stream });
-    result.meta.cookies = stream.cookies;
-    return result;
+    return buildAgentResult({ ok: true, query, conversation, resolution, stream, includeEvents });
   } catch (e) {
-    return {
+    const out = {
       ok: false,
       query: query || null,
       conversation: conversation || null,
@@ -613,19 +833,74 @@ async function braveLeoSearch(input = {}) {
       status: e && e.status,
       body: e && e.body,
       resolution,
+      meta: { cookies: jar.toString() || null },
     };
+    return out;
   }
 }
 
-/** Convenience wrapper: throw on failure, return structured result on success. */
+/** Throw on failure, return structured result on success. */
 async function braveLeoSearchOrThrow(input = {}) {
   const out = await braveLeoSearch(input);
   if (!out.ok) {
     const err = new Error(out.error || "braveLeoSearch failed");
     err.result = out;
+    err.status = out.status;
     throw err;
   }
   return out;
+}
+
+/**
+ * Stateful client for session/cookie reuse and convenience methods.
+ */
+class BraveLeoClient {
+  constructor(opts = {}) {
+    this.fetchImpl = opts.fetchImpl || globalThis.fetch;
+    this.cookieJar = opts.cookieJar instanceof CookieJar ? opts.cookieJar : new CookieJar(opts.cookies);
+    this.headers = opts.headers || null;
+    this.source = opts.source || "web";
+    this.timeoutMs = opts.timeoutMs;
+    this.retries = opts.retries || 0;
+  }
+  async resolveConversation(query, opts = {}) {
+    return resolveConversation(query, {
+      fetchImpl: this.fetchImpl,
+      headers: { ...(this.headers || {}), ...(opts.headers || {}) },
+      cookieJar: this.cookieJar,
+      source: opts.source || this.source,
+      timeoutMs: opts.timeoutMs ?? this.timeoutMs,
+      signal: opts.signal,
+    });
+  }
+  async ask(input = {}) {
+    const query = typeof input === "string" ? input : input.query;
+    const opts = typeof input === "string" ? {} : input;
+    return braveLeoSearch({
+      source: this.source,
+      timeoutMs: this.timeoutMs,
+      retries: this.retries,
+      ...opts,
+      query,
+      fetchImpl: this.fetchImpl,
+      headers: { ...(this.headers || {}), ...(opts.headers || {}) },
+      cookieJar: this.cookieJar,
+      cookies: undefined, // jar is authoritative
+    });
+  }
+  async stream(conversation, opts = {}) {
+    return streamWithAsk(conversation, {
+      fetchImpl: this.fetchImpl,
+      headers: { ...(this.headers || {}), ...(opts.headers || {}) },
+      cookieJar: this.cookieJar,
+      timeoutMs: opts.timeoutMs ?? this.timeoutMs,
+      retries: opts.retries ?? this.retries,
+      ...opts,
+    });
+  }
+  get cookies() {
+    return this.cookieJar.toString() || null;
+  }
 }
 
 /** OpenAI-compatible tool/function schema for agent tool-calling. */
@@ -635,19 +910,19 @@ const BRAVE_LEO_TOOL = {
     name: "brave_leo_search",
     description:
       "Web search and AI-grounded answer via Brave Leo / 'Answer with AI' (search.brave.com chatllm). " +
-      "Returns {answer, followups, sources/enrichments (references, urls, entities, context), usage}. " +
-      "Provide 'query' to best-effort resolve a conversation, or a known Brave 'conversation' id for direct streaming.",
+      "Returns answer text, follow-up suggestions, grounded sources/URLs/entities/context (when available), and token usage. " +
+      "Provide 'query' for best-effort conversation resolution, or a known Brave 'conversation' id for direct streaming.",
     parameters: {
       type: "object",
       properties: {
         query: {
           type: "string",
-          description: "Search/question to answer with Brave's web-grounded AI.",
+          description: "Search question or intent to answer with Brave's web-grounded AI.",
         },
         conversation: {
           type: "string",
           description:
-            "Existing Brave chatllm conversation id (hex, ~32 chars as observed). If omitted, proxy attempts best-effort resolution for the query.",
+            "Existing Brave chatllm conversation id (hex, ~32 chars as observed). If omitted, best-effort resolution is attempted for the query.",
         },
         enableInlineEntities: {
           type: "boolean",
@@ -659,6 +934,12 @@ const BRAVE_LEO_TOOL = {
           description: "Brave search source parameter (default: 'web').",
           default: "web",
         },
+        compact: {
+          type: "boolean",
+          description:
+            "If true, return a compact LLM-friendly result (answer, followups, source URLs, usage) without raw events.",
+          default: false,
+        },
       },
       additionalProperties: false,
       anyOf: [{ required: ["query"] }, { required: ["conversation"] }],
@@ -666,9 +947,10 @@ const BRAVE_LEO_TOOL = {
   },
 };
 
-/** Tool-dispatch friendly wrapper: (args) => Promise<result> */
+/** Tool-dispatch wrapper: (args) => Promise<result> */
 async function braveLeoSearchTool(args = {}) {
-  return braveLeoSearch(args);
+  const res = await braveLeoSearch({ ...args, includeEvents: args.compact ? false : args.includeEvents });
+  return args.compact ? compactResult(res) : res;
 }
 
 // --- ESM exports ---
@@ -677,7 +959,9 @@ export {
   WITH_ASK_PATH,
   BRAVE_LEO_TOOL,
   CookieJar,
+  BraveLeoClient,
   buildSearchUrl,
+  buildAskUrl,
   buildFollowupUrl,
   buildWithAskUrl,
   normalizeConversationId,
@@ -685,8 +969,11 @@ export {
   parseEventStream,
   reduceEvents,
   extractSources,
+  compactResult,
+  formatResultAsText,
   resolveConversation,
   streamWithAsk,
+  braveLeoEventStream,
   braveLeoSearch,
   braveLeoSearchOrThrow,
   braveLeoSearchTool,
@@ -701,7 +988,9 @@ try {
       WITH_ASK_PATH,
       BRAVE_LEO_TOOL,
       CookieJar,
+      BraveLeoClient,
       buildSearchUrl,
+      buildAskUrl,
       buildFollowupUrl,
       buildWithAskUrl,
       normalizeConversationId,
@@ -709,8 +998,11 @@ try {
       parseEventStream,
       reduceEvents,
       extractSources,
+      compactResult,
+      formatResultAsText,
       resolveConversation,
       streamWithAsk,
+      braveLeoEventStream,
       braveLeoSearch,
       braveLeoSearchOrThrow,
       braveLeoSearchTool,
@@ -732,14 +1024,27 @@ const isDirectRun = (() => {
 })();
 
 function parseArgs(argv) {
-  const out = { queryParts: [], conversation: null, json: false, stream: false, noEntities: false, source: "web" };
+  const out = {
+    queryParts: [],
+    conversation: null,
+    json: false,
+    stream: false,
+    compact: false,
+    noEntities: false,
+    source: "web",
+    cookies: null,
+    timeoutMs: null,
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--conversation" || a === "-c") out.conversation = argv[++i] || null;
     else if (a === "--json") out.json = true;
     else if (a === "--stream") out.stream = true;
+    else if (a === "--compact") out.compact = true;
     else if (a === "--no-inline-entities") out.noEntities = true;
     else if (a === "--source") out.source = argv[++i] || "web";
+    else if (a === "--cookies") out.cookies = argv[++i] || null;
+    else if (a === "--timeout") out.timeoutMs = Number(argv[++i]) || null;
     else if (a === "--help" || a === "-h") out.help = true;
     else out.queryParts.push(a);
   }
@@ -752,53 +1057,71 @@ if (isDirectRun) {
     const args = parseArgs(process.argv.slice(2));
     if (args.help || (!args.query && !args.conversation)) {
       console.error(
-        "Usage: node BraveSearchAPI.js <query> [--conversation <id>] [--source web] [--no-inline-entities] [--stream] [--json]\n" +
-          "  --stream  print answer deltas live (stderr shows meta on completion)\n" +
-          "  --json    print full structured JSON result"
+        [
+          "Usage: node BraveSearchAPI.js <query> [options]",
+          "       node BraveSearchAPI.js --conversation <id> [options]",
+          "",
+          "Options:",
+          "  -c, --conversation <id>   Stream a known Brave chatllm conversation id",
+          "      --source <src>        Brave search source (default: web)",
+          "      --cookies <str>       Cookie header for session continuity",
+          "      --timeout <ms>        Request timeout in milliseconds",
+          "      --no-inline-entities  Disable inline entity/enrichment request",
+          "      --stream              Print answer deltas live to stdout",
+          "      --compact             Print compact LLM-friendly JSON/text result",
+          "      --json                Print full structured JSON result",
+          "  -h, --help                Show this help",
+        ].join("\n")
       );
       process.exit(args.help ? 0 : 2);
     }
 
     try {
       let live = "";
-      const onEvent = args.stream && !args.json
-        ? (ev) => {
-            if (ev && ev.type === "text_delta" && typeof ev.delta === "string") {
-              process.stdout.write(ev.delta);
-              live += ev.delta;
+      const onEvent =
+        args.stream && !args.json
+          ? (ev) => {
+              if (ev && ev.type === "text_delta" && typeof ev.delta === "string") {
+                process.stdout.write(ev.delta);
+                live += ev.delta;
+              }
             }
-          }
-        : undefined;
+          : undefined;
 
       const out = await braveLeoSearch({
         query: args.query || undefined,
         conversation: args.conversation || undefined,
         enableInlineEntities: !args.noEntities,
         source: args.source,
+        cookies: args.cookies || undefined,
+        timeoutMs: args.timeoutMs || undefined,
         onEvent,
+        includeEvents: !args.compact,
       });
 
+      const view = args.compact ? compactResult(out) : out;
+
       if (args.json) {
-        console.log(JSON.stringify(out, null, 2));
+        console.log(JSON.stringify(view, null, 2));
       } else if (args.stream) {
-        if (!live && out.answer) process.stdout.write(out.answer);
+        if (!live && (view.answer || out.answer)) process.stdout.write(view.answer || out.answer);
         process.stdout.write("\n");
-        if (out.followups && out.followups.length) {
-          console.error("\nFollow-ups: " + JSON.stringify(out.followups));
-        }
-        if (out.sources) {
-          const refs = [...(out.sources.references || []), ...(out.sources.urls || []), ...(out.sources.reference_urls || [])];
-          if (refs.length) console.error("Sources: " + JSON.stringify(refs.slice(0, 10)));
-        }
-        if (!out.ok) console.error("Error: " + out.error);
+        if (out.conversation) console.error(`\n[conversation] ${out.conversation}`);
+        const followups = view.followups || out.followups || [];
+        if (followups.length) console.error("[followups] " + JSON.stringify(followups));
+        const srcs = (view.sources && Array.isArray(view.sources) ? view.sources : (out.sources && out.sources.all_urls) || []).slice(0, 10);
+        if (srcs.length) console.error("[sources] " + JSON.stringify(srcs));
+        if (!out.ok) console.error("[error] " + out.error);
       } else {
         if (out.ok) {
-          console.log(out.answer || "");
-          if (out.followups && out.followups.length) console.log("\nFollow-ups:\n" + JSON.stringify(out.followups, null, 2));
-          const refs = out.sources ? [...(out.sources.references || []), ...(out.sources.urls || []), ...(out.sources.reference_urls || []), ...(out.sources.context_urls || [])] : [];
-          if (refs.length) console.log("\nSources:\n" + JSON.stringify(refs, null, 2));
+          if (args.compact) {
+            console.log(JSON.stringify(view, null, 2));
+          } else {
+            console.log(formatResultAsText(out));
+            if (out.conversation) console.error(`\n[conversation] ${out.conversation}`);
+          }
         } else {
-          console.error(JSON.stringify(out, null, 2));
+          console.error(JSON.stringify(view, null, 2));
         }
       }
       process.exit(out.ok ? 0 : 1);
