@@ -1,0 +1,10 @@
+{"type":"nav","msg":"goto"}
+{"type":"poll","i":0,"title":"Just a moment...","url":"https://www.perplexity.ai/"}
+{"type":"poll","i":5,"title":"Just a moment...","url":"https://www.perplexity.ai/"}
+{"type":"poll","i":10,"title":"Just a moment...","url":"https://www.perplexity.ai/"}
+{"type":"poll","i":15,"title":"Just a moment...","url":"https://www.perplexity.ai/"}
+{"type":"poll","i":20,"title":"Just a moment...","url":"https://www.perplexity.ai/"}
+{"type":"poll","i":25,"title":"Just a moment...","url":"https://www.perplexity.ai/"}
+{"type":"title","title":"Just a moment...","url":"https://www.perplexity.ai/"}
+{"type":"no_input"}
+{"type":"final","url":"https://www.perplexity.ai/","title":"Just a moment..."}

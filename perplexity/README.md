@@ -8,6 +8,10 @@ Method: static/client-behavior analysis from known web-client patterns and publi
 
 This documents the *unofficial web-client API* used by the Perplexity web app (not the official `api.perplexity.ai` developer API). It is intended for interoperability research and defensive understanding.
 
+## Live capture status (Chromium)
+
+An automated Chromium capture was attempted in this environment (Playwright Chromium 1254, puppeteer-extra-stealth, headless and xvfb-headed). Cloudflare managed challenge/Turnstile did not clear, so no SPA/API traffic was observed. See **`chromium_capture.md`** for tooling, artifacts (`home_stealth.html`, `home_stealth.png`, scripts, logs), and steps to complete capture from a real browser session/HAR.
+
 ## High-level architecture
 
 - **Transport:** HTTPS + Server-Sent Events (SSE) for streaming answers; some flows historically used Socket.IO polling/websocket transports.
