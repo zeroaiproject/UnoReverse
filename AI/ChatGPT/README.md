@@ -2,18 +2,28 @@
 
 Target: `https://chatgpt.com/` (unauthenticated/mobile-web "unauth-mweb" shell)  
 Date: 2026-11-13  
-Method: automated Chromium capture (Playwright-bundled Chromium 1254, headless) loading the home page and attempting a prompt input. Network, assets, and bootstrap API calls were recorded.
+Method: automated Chromium captures (Playwright-bundled Chromium 1254, headless) of the unauth-mweb flow: bootstrap/prepare and a **successful end-to-end conversation turn**.
 
 ## Scope
 
-Documents the *unofficial unauthenticated web-client interface* observed from the `chatgpt.com` unauth-mweb experience (not the OpenAI developer API). Capture is bootstrap/input-start oriented (no completed conversation turn observed).
+Documents the *unofficial unauthenticated web-client interface* observed from the `chatgpt.com` unauth-mweb experience (not the OpenAI developer API), including bootstrap, anti-abuse/sentinel steps, conversation submit, and streamed response.
 
-## Live capture (Chromium)
+## Live captures (Chromium)
 
 - Browser: `/root/.cache/ms-playwright/chromium-1254/chrome-linux64/chrome` (headless)
+
+### 1) Bootstrap capture
 - Script: `capture_chatgpt.mjs`
 - Result: page loaded (`title: "ChatGPT: Chat, Work, Create & Code with AI"`, `url: https://chatgpt.com/`), prompt/composer assets loaded, input focus/start events observed; sentinel and conversation prepare calls captured.
-- Artifacts: `home.html`, `home.png`, `after.html`, `page_assets.json`, `network_capture.jsonl`, `capture_chatgpt.mjs`
+- Artifacts: `home.html`, `home.png`, `after.html`, `page_assets.json`, `network_capture.jsonl`
+
+### 2) Conversation capture (successful)
+- Script: `capture_chatgpt_convo.mjs`
+- Prompt submitted: `Reply with exactly: PONG`
+- Result: conversation created and streamed to completion; assistant replied `PONG`.
+- Final page: `https://chatgpt.com/uc/6af7769c-b358-83ea-91dd-1ed7377e6bc0`
+- Observed IDs (from this run): `operationId=8f21fb37-0b08-49a3-964b-aa82c4800123`, `oai-session-id=edaafb08-a3ea-41c9-9371-6247e985bf6c`, `conversationId=6af7769c-b358-83ea-91dd-1ed7377e6bc0`, user msg `92256950-28f5-4456-8f00-e5ae54f88984`, assistant msg `aca6515e-7af2-4ef0-b357-05a72c1ba43b`.
+- Artifacts: `convo_after.html`, `convo_after.png`, `network_capture_convo.jsonl`, `capture_convo.log`
 
 ## Observed architecture
 
@@ -24,6 +34,12 @@ Documents the *unofficial unauthenticated web-client interface* observed from th
   3. `POST /unauth-mweb/conversation/prepare?lightweight_authenticated=0` → returns `conduit_token` (JWT/ES256) + `prepare_cadence_enabled`.
   4. Auth/account context probe: `GET /api/auth/account-picker` → `{"unified_sessions":[]}` (unauth).
   5. Anonymous beacon: `GET /backend-anon/beacons/home?product=chatgpt`.
+- **Conversation turn flow observed (successful):**
+  1. `POST /unauth-mweb/sentinel/chat-requirements/prepare` → `prepare_token`.
+  2. `POST /unauth-mweb/sentinel/chat-requirements/finalize` with `{"prepare_token":"..."}` (seen after prepare; a second finalize observed around submit time in captured trace).
+  3. Submit prompt: `POST /unauth-mweb/conversation/updates?lightweight_authenticated=0&operationId=<uuid>` (form fields: `prompt`, `chatRequirementsToken`, `proofToken`, `turnstileToken`, `oai-session-id`, `assistantMessageId` pending, `userMessageId`, `conversationState`, `clientContextualInfo`, `conversationRetryOwner`, `timezone`/`timezoneOffsetMinutes`, attachments/metadata, timing fields etc.).
+  4. Streamed response on the same updates endpoint: NDJSON `application/vnd.openai.conversation-source+ndjson` (`version/type` frames: `control` started/conversation-id/resume-token/assistant-content-started/last-token-received/turn-latency/terminal-received, `shared` HTML templates, `content` DIL/markdown, `state` updates, final `end`) yielding `conversationId`, `canonicalPath` `/uc/<id>`, `stopConduitToken`, `resumeToken`, and assistant output (DIL `constants["0"]="PONG"` / `fallbackMarkdown:"PONG"`).
+  5. `POST /unauth-mweb/sentinel/ping` observed with headers `openai-sentinel-chat-requirements-token` and `oai-session-id` (and related sentinel/affinity headers in context).
 
 ## Endpoints & payloads observed
 
@@ -45,6 +61,32 @@ Documents the *unofficial unauthenticated web-client interface* observed from th
   - `conduit_token`: JWT (ES256, header `alg=ES256,typ=JWT`; payload observed to include `conduit_uuid`, `conduit_location`, `cluster`, `iat`, `exp`, `turn_topic_id`)
   - `prepare_cadence_enabled`: `true`
 
+### `POST /unauth-mweb/sentinel/chat-requirements/finalize`
+- **Request (JSON):** `{"prepare_token":"<token from prepare>"}`
+- Used before/around conversation submit (finalize observed in captured turn flow).
+
+### `POST /unauth-mweb/conversation/updates?lightweight_authenticated=0&operationId=<uuid>` (submit + stream)
+- **Submit request:** `application/x-www-form-urlencoded` (POST) with fields observed including:
+  - `prompt` (user text, e.g. `Reply with exactly: PONG`)
+  - `chatRequirementsToken`, `proofToken`, `turnstileToken` (opaque/anti-abuse tokens)
+  - `oai-session-id`
+  - `assistantMessageId` (e.g. `pending-<uuid>`), `userMessageId`
+  - `conversationState` (e.g. `{"messages":[],"parentMessageId":"client-created-root","safety":{"dismissedInterventionIds":[]},"userMessageCount":0}` for first turn)
+  - `conversationRetryOwner`, `clientContextualInfo`, `timezone`, `timezoneOffsetMinutes`
+  - `imageAttachments=[]`, `pendingImageUploads=[]`, `imageSaveData`, `imageEffectiveType`, `messageMetadata`, `workOrigin/Model/Effort/Tier`, `timingToken`, `telemetryToken` (as seen)
+- **Streamed response:** `content-type: application/vnd.openai.conversation-source+ndjson` (NDJSON, one JSON object per line), `version: 2` frames such as:
+  - `control` / `kind=started` (operationId, streamType)
+  - `shared` (HTML template fragments)
+  - `control` / `kind=conversation-id` with `conversationId`, `canonicalPath` (`/uc/<id>`), and `stopConduitToken`
+  - `control` / `kind=resume-token` with `resumeToken`
+  - `content` (messageId, revision/mode, `markdown`, `dil` renderer/payload with `constants` and `fallbackMarkdown`, status `streaming`→`complete`, `streamingParent`)
+  - `control` / `kind=assistant-content-started`, `last-token-received`, `turn-latency` (tags/TTFB/TTFVT metrics), `terminal-received`
+  - `state` updates (`conversationState` with `backendConversationId`, `parentMessageId`, `userMessageCount`, `safety`)
+  - final `{"version":2,"type":"end"}`
+
+### `POST /unauth-mweb/sentinel/ping`
+- Observed during/around turn with headers including `openai-sentinel-chat-requirements-token` and `oai-session-id` (plus other sentinel/affinity headers); used as part of anti-abuse/sentinel flow.
+
 ### `GET /api/auth/account-picker`
 - **Response:** `{"unified_sessions":[]}` (unauth context)
 
@@ -63,9 +105,10 @@ Static bundles under `/unauth-mweb/assets/` indicate client-side handling for: s
 
 ## Gaps / next steps
 
-- No completed message send/stream captured in this run (prompt typed but full conversation submit/stream endpoint not confirmed from captured traffic). A fuller flow likely involves authenticated/anon conversation submit endpoints (e.g. backend-anon/backend-api conversation/stream paths) using `prepare_token`/`conduit_token` and additional anti-abuse/sentinel signals.
-- To extend: capture a full successful turn (submit prompt, observe streaming response transport and request schema), correlate tokens/headers to requests, and trace bundle code for request builders and stream parsers.
+- Map token provenance precisely (how `chatRequirementsToken`/`proofToken`/`turnstileToken` are derived), and correlate `conduit_token`/stop/resume tokens to stream lifecycle and reconnection.
+- Capture multi-turn follow-ups and alternative transports/modes (attachments, edits, retries) to confirm state evolution (`conversationState`, parent/message IDs).
+- Trace unauth-mweb bundles for request builders, sentinel/proof generation, and NDJSON/DIL stream parsing.
 
 ## Limitations
 
-Unauthenticated, partial/bootstrap capture. Tokens, build IDs, asset hashes, and schemas are versioned and ephemeral. No credentials or user content beyond a test prompt attempt included. Use only in accordance with applicable terms/law.
+Unauthenticated capture. Tokens, build/asset IDs, endpoint params, and schemas are versioned, ephemeral, and session-bound. Captured artifacts include opaque tokens/blobs and a single test prompt/response (`PONG`). Use only in accordance with applicable terms/law.
