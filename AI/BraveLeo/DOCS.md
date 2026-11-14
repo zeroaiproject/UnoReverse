@@ -204,6 +204,72 @@ The `with_ask` response is a **line-delimited sequence of JSON event objects** (
 | `q` | search/ask URL | `Reply with exactly: PONG` |
 | feature callbacks | `/a/features?feature=chatllm...` | include `timestamp` + `nonce` |
 
+> **Shape correction (2026-11-14):** the captured id is **38 hex chars**, not 32. `normalizeConversationId` accepts 16–64 hex chars so both lengths work; anything that is not hex is treated as "absent" rather than "invalid".
+
+---
+
+## Client Library (`src/`) — v0.2
+
+`AI/BraveLeo/BraveSearchAPI.js` is now a thin compatibility entry point over
+`AI/BraveLeo/src/`. The observable contract is unchanged; the internals are
+split by concern so the protocol layer can be tested without network access.
+
+| Module | Responsibility |
+|---|---|
+| `constants.js` | Origin, `with_ask` path, header sets, timeouts, size caps, id regex |
+| `errors.js` | `ERROR_CODES`, `BraveLeoError`, status→code mapping, backoff, retries |
+| `http.js` | Header merge, `CookieJar`, bounded body reads |
+| `conversation.js` | URL builders, id extraction, best-effort resolution + diagnostics |
+| `stream.js` | TAP/SSE incremental parser, event reduction, citations |
+| `search.js` | `with_ask` execution, retry wrapper, `braveLeoSearch` |
+| `result.js` | Full result, compact payload, text renderer |
+| `client.js` | `BraveLeoClient`, `UsageTracker`, conversation cache |
+| `tools.js` | OpenAI/Anthropic tool schemas, `executeToolCall` |
+| `cli.js` | `parseArgs`, `main`, exit codes |
+
+### Options that matter
+
+| Option | Default | Effect |
+|---|---|---|
+| `conversation` | — | Skip resolution entirely (most reliable path) |
+| `cookies` / `cookieJar` | — | Session continuity; cookie header is sent but never returned unless `includeCookies` |
+| `timeoutMs` | `30000` | Whole-request budget (headers + first byte) |
+| `streamIdleTimeoutMs` | `45000` | Abort a stream that stops producing bytes (`0` disables) |
+| `maxResponseBytes` | `8 MiB` | Hard body cap; oversized responses throw instead of truncating |
+| `retries` | `0` | Retries for 429/408/425/5xx/network/timeout only |
+| `retryOn(err, attempt)` | — | Veto/extend the retry policy per error |
+| `allowPartial` | `true` | Return text received before a stream failure (`partial: true`) |
+| `includeEvents` | `true` | Keep raw events on the result (off for tool payloads) |
+| `includeCookies` | `false` | Include session cookies in `meta.cookies` / `resolution.cookies` |
+| `usageTracker` | — | Accumulate prompt/completion/reasoning tokens across calls |
+
+### Behavior guarantees added in v0.2
+
+- **Chunk-safe parsing.** A JSON frame split across reads is reassembled; SSE framing (`data:`, `event:`, comments, multi-line payloads, `[DONE]`) is accepted alongside bare TAP lines.
+- **Answer precedence.** `enrichments.raw_response` → `text_stop.text` → assembled deltas. Deltas can duplicate fragments (observed `***PONG**` vs `**PONG**`), so they are the fallback, and `answerSource` records which was used.
+- **Attempt-level diagnostics.** Failed resolution returns `attempts[]` with `strategy`, `status`, `code`, `hint` and timing — a `429` is reported as rate limiting/anti-bot, not as a missing conversation.
+- **No silent secret leakage.** Cookies are stripped from results, `meta.resolution` and `errorInfo.details` unless explicitly requested.
+- **Abortable generator.** Breaking out of `braveLeoEventStream` cancels the in-flight request instead of leaving it running.
+- **Retry hygiene.** Abortable sleep removes its listener; `Retry-After` is clamped to `maxRetryDelayMs`.
+
+### Additional observations (2026-11-14)
+
+Probes from a datacenter egress with a fresh cookie jar, documented because they
+define what a client can and cannot do without a real browser session:
+
+| Request | Status | Interpretation |
+|---|---|---|
+| `GET /` | `200 text/html` | Homepage reachable, cookies issued |
+| `GET /search?q=...&source=web` | `429 text/html` | Search is behind anti-bot on this egress |
+| `GET /ask?q=...` | `403 text/html` | Ask surface blocked |
+| `GET /api/chatllm/with_ask` (no `conversation`) | `422 text/html` | Route exists; `conversation` is mandatory |
+| `GET /api/chatllm/with_ask?conversation=<fake>` | `404 text/html` | Unknown conversation rejected |
+| `GET /api/chatllm/ask`, `/stream`, `/conversation` | `404 text/html` | Not routes (no alternate initiation endpoint found) |
+
+Conclusion: conversation **creation** is not reachable from a non-browser
+session; the id must come from a real browsing context. Everything after that
+(the `with_ask` stream) is reproducible with the id + cookies.
+
 ---
 
 ## Related Surfaces
@@ -215,11 +281,12 @@ The `with_ask` response is a **line-delimited sequence of JSON event objects** (
 
 ## Gaps & Next Steps
 
-- **Conversation initiation:** capture the exact request/trigger that creates the `conversation` ID and submits the prompt (search param, XHR/fetch, or feature action).
-- **Follow-ups & callbacks:** exercise `ask_followup`, `show_more`, `share_link`, `close_chat`, `open_leo` and document request/response schemas.
+- **Conversation initiation:** still the open problem. `/search` and `/ask` are behind anti-bot (`429`/`403`) from non-browser egress (see observations above); the `with_ask` route requires an id that only a real browsing context obtains. Next step: capture the in-page XHR that creates the id with a persistent browser profile, then replay it with the same cookies and headers.
+- **Follow-ups & callbacks:** exercise `ask_followup`, `show_more`, `share_link`, `close_chat`, `open_leo` and document request/response schemas — `buildFollowupUrl()` already models the observed `/ask?...&query_type=answer_with_ai_follow_up` shape.
 - **Authenticated/premium flows:** compare behavior for logged-in or Brave Premium/Leo contexts and any additional headers/tokens.
-- **Richer answers:** capture responses with citations, entities, images, and `context*` populated to fully map `enrichments`.
+- **Richer answers:** capture responses with citations, entities, images, and `context*` populated to fully map `enrichments` (the parser handles them; no populated sample is committed).
 - **Standalone Leo:** capture `leo.brave.com` or in-browser Leo API surfaces (if accessible) for a complete Leo-specific protocol view.
+- **Format drift:** the parser accepts both TAP and SSE framing on purpose — if Brave switches, add a fixture to `AI/BraveLeo/test/` rather than patching regexes blind.
 
 ---
 

@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["20", "22", "24"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Syntax check (entry point + modules)
+        run: |
+          node --check AI/BraveLeo/BraveSearchAPI.js
+          for f in AI/BraveLeo/src/*.js; do node --check "$f"; done
+
+      - name: Tests (offline, mocked HTTP)
+        run: node --test AI/BraveLeo/test/*.test.js
+
+      - name: CLI smoke test
+        run: |
+          node AI/BraveLeo/BraveSearchAPI.js --version
+          node AI/BraveLeo/BraveSearchAPI.js --help > /dev/null

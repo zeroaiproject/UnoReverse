@@ -1,0 +1,20 @@
+{
+  "name": "unoreverse",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Reverse-engineering notes and research tooling for web-based AI services",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "bin": {
+    "brave-leo": "./AI/BraveLeo/BraveSearchAPI.js"
+  },
+  "scripts": {
+    "test": "node --test AI/BraveLeo/test/*.test.js",
+    "test:watch": "node --test --watch AI/BraveLeo/test/*.test.js",
+    "check": "node --check AI/BraveLeo/BraveSearchAPI.js",
+    "brave:leo": "node AI/BraveLeo/BraveSearchAPI.js",
+    "brave:leo:help": "node AI/BraveLeo/BraveSearchAPI.js --help"
+  }
+}
