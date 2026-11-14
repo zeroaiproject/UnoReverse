@@ -1,6 +1,6 @@
 {
   "name": "unoreverse",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Reverse-engineering notes and research tooling for web-based AI services",
@@ -8,13 +8,27 @@
     "node": ">=20.11"
   },
   "bin": {
-    "brave-leo": "./AI/BraveLeo/BraveSearchAPI.js"
+    "brave-leo": "./AI/BraveLeo/BraveSearchAPI.js",
+    "obscurify": "./AI/Obscurify/ObscurifyAPI.js",
+    "kilo-ai": "./AI/KiloAI/KiloAPI.js",
+    "chatgpt-web": "./AI/ChatGPT/ChatGPTAPI.js",
+    "lumo": "./AI/Lumo/LumoAPI.js",
+    "venice-ai": "./AI/VeniceAI/VeniceAPI.js"
   },
   "scripts": {
-    "test": "node --test AI/BraveLeo/test/*.test.js",
-    "test:watch": "node --test --watch AI/BraveLeo/test/*.test.js",
-    "check": "node --check AI/BraveLeo/BraveSearchAPI.js",
+    "test": "node --test AI/BraveLeo/test/*.test.js AI/Obscurify/test/*.test.js AI/KiloAI/test/*.test.js AI/ChatGPT/test/*.test.js AI/Lumo/test/*.test.js AI/VeniceAI/test/*.test.js",
+    "test:brave": "node --test AI/BraveLeo/test/*.test.js",
+    "test:obscurify": "node --test AI/Obscurify/test/*.test.js",
+    "test:kilo": "node --test AI/KiloAI/test/*.test.js",
+    "test:chatgpt": "node --test AI/ChatGPT/test/*.test.js",
+    "test:lumo": "node --test AI/Lumo/test/*.test.js",
+    "test:venice": "node --test AI/VeniceAI/test/*.test.js",
+    "check": "node --check AI/BraveLeo/BraveSearchAPI.js && node --check AI/Obscurify/ObscurifyAPI.js && node --check AI/KiloAI/KiloAPI.js && node --check AI/ChatGPT/ChatGPTAPI.js && node --check AI/Lumo/LumoAPI.js && node --check AI/VeniceAI/VeniceAPI.js",
     "brave:leo": "node AI/BraveLeo/BraveSearchAPI.js",
-    "brave:leo:help": "node AI/BraveLeo/BraveSearchAPI.js --help"
+    "obscurify": "node AI/Obscurify/ObscurifyAPI.js",
+    "kilo": "node AI/KiloAI/KiloAPI.js",
+    "chatgpt": "node AI/ChatGPT/ChatGPTAPI.js",
+    "lumo": "node AI/Lumo/LumoAPI.js",
+    "venice": "node AI/VeniceAI/VeniceAPI.js"
   }
 }

@@ -3,6 +3,32 @@
 All notable changes to the tooling in this repository. Documentation-only
 additions for other services are noted under "Docs".
 
+## [0.3.0] — 2026-11-14
+
+### Shared provider toolkit
+
+- Added `lib/` with provider-agnostic, zero-dependency helpers used by all new clients:
+  - `lib/errors.js` — `ApiError` (provider-scoped), status classification, `withRetry`/`withTimeout`/backoff, abort handling.
+  - `lib/http.js` — header merging, `CookieJar`, bounded body reads, `requestText`/`requestJson`/`requestResponse`.
+  - `lib/stream.js` — `SseParser`/`iterateFrames` for SSE, NDJSON and bare JSON lines with idle timeout and `[DONE]` handling.
+  - `lib/proxy.js` — SOCKS5/`socks5h` and HTTP-CONNECT tunneling, `createProxyFetch` (Node fetch has no SOCKS support), and Tor control-port `SIGNAL NEWNYM`.
+  - `lib/openai.js` — OpenAI-style `chat.completion[.chunk]` delta/usage extraction.
+  - `lib/cli.js` — stdin, `role=text` messages, numeric/JSON arg parsing, live delta printing, output routing, exit codes.
+
+### Provider clients (new)
+
+- **Obscurify** (`AI/Obscurify/ObscurifyAPI.js`, `src/*`): guest keyless `POST /anon/chat/completions` (SSE) with reasoning/tool/usage parsing, `x-obscurify-thread` reuse, model/frontier/uncensored catalogs and code-mode config; CLI and offline tests.
+- **Kilo AI** (`AI/KiloAI/KiloAPI.js`, `src/*`): keyless OpenAI-compatible gateway client with built-in SOCKS5 egress and Tor circuit renewal on 429/403 (`--tor`, configurable control auth); model listing, streaming/non-streaming chat, CLI and offline tests (in-process fake SOCKS5 server).
+- **ChatGPT unauth-mweb** (`AI/ChatGPT/ChatGPTAPI.js`, `src/*`): `conversation/prepare` + NDJSON v2 `conversation/updates` stream decoding (control/state/content/replace/end). Browser-generated sentinel/proof/turnstile/chatRequirements tokens are explicit inputs (`tokens` / `getRequirements` hook) rather than guessed; CLI and offline tests.
+- **Lumo (Proton)** (`AI/Lumo/LumoAPI.js`, `src/*`): guest session → cookie bootstrap, models/limits, encrypted SSE chat with a pluggable codec hook (`encodeContent`/`decodeText`/`requestKey`) because E2E plaintext is not observable on the wire; usage/remaining-limits collection, CLI and offline tests.
+- **Venice.ai** (`AI/VeniceAI/VeniceAPI.js`, `src/*`): client-attestation mint pool (`count:5`), agent inference with `x-venice-*` headers and re-mint/retry on 401/403, tolerant raw-frame parsing (successful automated stream not captured), metadata endpoints, CLI and offline tests.
+
+### Docs, packaging & CI
+
+- Root `README.md` rewritten to document all provider tooling, shared `lib/`, structure, and per-provider quick start/limits.
+- Added "Client" sections to `AI/Obscurify|KiloAI|ChatGPT|Lumo|VeniceAI/DOCS.md`.
+- `package.json` bumped to 0.3.0 with per-provider bins/scripts; CI now syntax-checks and tests all providers and runs CLI smoke tests on Node 20/22/24.
+
 ## [0.2.0] — 2026-11-14
 
 ### Brave Leo client — structure

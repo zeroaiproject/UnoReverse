@@ -357,3 +357,28 @@ Observed `POST /api/inference/chat/agents/venice` JSON body:
 ---
 
 *Generated from live Chromium captures of `venice.ai` → `outerface.venice.ai` (chat/agent v2 flow), 2026-11-13.*
+
+---
+
+## Client
+
+A zero-dependency Node.js client and CLI live in [`VeniceAPI.js`](./VeniceAPI.js) / [`src/`](./src/), implementing the observed attestation + agent-inference contract.
+
+- **Attestation:** mints a pool of short-lived ES256 client-attestation JWTs (`POST /api/app/user/client_attestation/mint`, `count:5`, runtime `env` signals) and attaches one per request as `x-venice-client-attestation`. On 401/403 the pool is flushed, re-minted, and the request retried (with `x-retry-count`).
+- **Inference:** `POST /api/inference/chat/agents/venice` with `Accept: text/event-stream`, `x-venice-*` headers, and the observed `{ clientTools, input: { messages: [...] } }` body. Because no successful stream was captured in automation (`env.webdriver:true`), the parser is tolerant: every raw frame is preserved and text is extracted on a best-effort basis.
+- **Metadata:** `GET /api/app/models`, `/api/app/user_country`, `/api/inference/rate-limits`.
+- **Offline tests:** mocked mint/retry/SSE flow (`node --test AI/VeniceAI/test/*.test.js`).
+
+```bash
+node AI/VeniceAI/VeniceAPI.js "Reply with exactly: PONG" --json   # inspect rawFrames
+node AI/VeniceAI/VeniceAPI.js --models
+node AI/VeniceAI/VeniceAPI.js --rate-limits
+```
+
+```js
+import { veniceChat, VeniceClient } from "./AI/VeniceAI/VeniceAPI.js";
+
+const client = new VeniceClient({ retries: 1, env: { webdriver: false } });
+const res = await client.chat({ prompt: "Reply with exactly: PONG" });
+// res = { ok, answer (best-effort), rawFrames, meta, ... }
+```

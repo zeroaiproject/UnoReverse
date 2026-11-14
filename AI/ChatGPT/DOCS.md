@@ -431,3 +431,29 @@ prompt=Reply%20with%20exactly%3A%20PONG
 ---
 
 *Generated from live Chromium captures of `chatgpt.com` (unauth-mweb), 2026-11-13.*
+---
+
+## Client
+
+A zero-dependency Node.js client and CLI live in [`ChatGPTAPI.js`](./ChatGPTAPI.js) / [`src/`](./src/), implementing the observed unauth-mweb flow end-to-end where the inputs are known.
+
+- **Flow:** `conversation/prepare` (conduit token) → optional sentinel prepare/finalize (when `p` is supplied) → `POST /conversation/updates?...&operationId=` → NDJSON v2 stream decoded into `control`/`state`/`text_delta`/`text_replace`/`end`.
+- **Anti-abuse tokens:** `chatRequirementsToken`, `proofToken`, `turnstileToken` are browser-generated and were not reverse-engineered. Supply them via `tokens`/CLI flags, or a `getRequirements(context)` hook that receives the session/prepare context and returns them. Missing tokens fail with a clear hint (submit can be forced for debugging with `allowMissingTokens`).
+- **Stateful turns:** the server's `state` frames return `conversationState` (with `backendConversationId`/`parentMessageId`) for follow-ups.
+- **Offline tests:** mocked NDJSON streams (`node --test AI/ChatGPT/test/*.test.js`).
+
+```bash
+node AI/ChatGPT/ChatGPTAPI.js "Reply with exactly: PONG" \
+  --requirements-token ... --proof-token ... --turnstile-token ... --json
+```
+
+```js
+import { chatGPTChat, ChatGPTClient } from "./AI/ChatGPT/ChatGPTAPI.js";
+
+const client = new ChatGPTClient({
+  tokens: { chatRequirementsToken, proofToken, turnstileToken },
+  // or: getRequirements: async (ctx) => acquireTokensFromBrowser(ctx),
+});
+const res = await client.chat({ prompt: "Reply with exactly: PONG" });
+// res = { ok, answer, conversationId, conversationState, sessionId, frames, ... }
+```

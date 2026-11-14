@@ -21,15 +21,29 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
-      - name: Syntax check (entry point + modules)
+      - name: Syntax check (entry points + modules)
         run: |
-          node --check AI/BraveLeo/BraveSearchAPI.js
-          for f in AI/BraveLeo/src/*.js; do node --check "$f"; done
+          for f in AI/BraveLeo/BraveSearchAPI.js AI/Obscurify/ObscurifyAPI.js AI/KiloAI/KiloAPI.js AI/ChatGPT/ChatGPTAPI.js AI/Lumo/LumoAPI.js AI/VeniceAI/VeniceAPI.js; do
+            node --check "$f"
+          done
+          for f in lib/*.js AI/BraveLeo/src/*.js AI/Obscurify/src/*.js AI/KiloAI/src/*.js AI/ChatGPT/src/*.js AI/Lumo/src/*.js AI/VeniceAI/src/*.js; do
+            node --check "$f"
+          done
 
       - name: Tests (offline, mocked HTTP)
-        run: node --test AI/BraveLeo/test/*.test.js
+        run: node --test AI/BraveLeo/test/*.test.js AI/Obscurify/test/*.test.js AI/KiloAI/test/*.test.js AI/ChatGPT/test/*.test.js AI/Lumo/test/*.test.js AI/VeniceAI/test/*.test.js
 
       - name: CLI smoke test
         run: |
           node AI/BraveLeo/BraveSearchAPI.js --version
+          node AI/Obscurify/ObscurifyAPI.js --version
+          node AI/KiloAI/KiloAPI.js --version
+          node AI/ChatGPT/ChatGPTAPI.js --version
+          node AI/Lumo/LumoAPI.js --version
+          node AI/VeniceAI/VeniceAPI.js --version
           node AI/BraveLeo/BraveSearchAPI.js --help > /dev/null
+          node AI/Obscurify/ObscurifyAPI.js --help > /dev/null
+          node AI/KiloAI/KiloAPI.js --help > /dev/null
+          node AI/ChatGPT/ChatGPTAPI.js --help > /dev/null
+          node AI/Lumo/LumoAPI.js --help > /dev/null
+          node AI/VeniceAI/VeniceAPI.js --help > /dev/null

@@ -228,3 +228,28 @@ curl -sS --socks5-hostname 127.0.0.1:9050 \
 ---
 
 *Technical reference — observed/expected behavior of Kilo AI anonymous gateway access via Tor; subject to change.*
+---
+
+## Client
+
+A zero-dependency Node.js client and CLI live in [`KiloAPI.js`](./KiloAPI.js) / [`src/`](./src/). It implements the keyless OpenAI-compatible chat contract and, because Node's `fetch` has no SOCKS support, ships a built-in SOCKS5/HTTP-CONNECT transport plus Tor control-port circuit renewal in [`/lib/proxy.js`](../../lib/proxy.js).
+
+- **Gateway:** `POST /api/gateway/v1/chat/completions` (no API key), default model `reflection/beam-free`.
+- **Proxy/Tor:** `--proxy socks5h://127.0.0.1:9050` or `--tor`; on 429/403 the client can `SIGNAL NEWNYM` and retry (`--retries`, control host/port/password/cookie configurable).
+- **Streaming:** OpenAI-style SSE chunks and usage.
+- **Offline tests:** mocked fetch + a fake in-process SOCKS5 server (`node --test AI/KiloAI/test/*.test.js`).
+
+```bash
+node AI/KiloAI/KiloAPI.js "Explain how you work" --stream
+node AI/KiloAI/KiloAPI.js "Explain how you work" --tor --retries 2
+node AI/KiloAI/KiloAPI.js --models --proxy socks5h://127.0.0.1:9050
+```
+
+```js
+import { kiloChat, KiloClient } from "./AI/KiloAI/KiloAPI.js";
+
+const res = await kiloChat({ prompt: "Hello", proxy: "socks5h://127.0.0.1:9050", tor: true, retries: 1 });
+// res.meta.proxy / res.meta.torRotations record egress and circuit renewals
+
+const client = new KiloClient({ proxy: "socks5h://127.0.0.1:9050", renewIdentity: myHook });
+```

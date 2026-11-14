@@ -447,3 +447,30 @@ Responses include a strict CSP (representative): `default-src 'self'`; `connect-
 ---
 
 *Generated from live Chromium captures of `lumo.proton.me` (guest flow, `/api/ai/v1/chat/completions`), 2026-11-13.*
+
+---
+
+## Client
+
+A zero-dependency Node.js client and CLI live in [`LumoAPI.js`](./LumoAPI.js) / [`src/`](./src/), covering the guest bootstrap and streaming protocol.
+
+- **Guest flow:** `POST /api/auth/v4/sessions` → `POST /api/core/v4/auth/cookies` → `GET /api/ai/v1/models|limits` → `POST /api/ai/v1/chat/completions` (SSE). Cookies/`x-pm-uid` are managed automatically.
+- **Encrypted completions:** request/response message content is E2E-encrypted on the wire (`encrypted:true`, `lumo.request_key`). The client exposes a pluggable `codec` (`encodeContent`, `decodeText`, `requestKey`); without a browser-derived codec it sends/returns ciphertext and emits an explicit warning (plaintext is not recoverable from the network alone).
+- **Usage:** streamed `usage` chunks (including `remaining_limits`/`applied_limit_category`) are collected into the result.
+- **Offline tests:** mocked guest/session/SSE flow (`node --test AI/Lumo/test/*.test.js`).
+
+```bash
+node AI/Lumo/LumoAPI.js --models
+node AI/Lumo/LumoAPI.js --limits
+node AI/Lumo/LumoAPI.js "Reply with exactly: PONG" --json   # needs a codec for plaintext
+```
+
+```js
+import { lumoChat, LumoClient } from "./AI/Lumo/LumoAPI.js";
+
+const res = await lumoChat({
+  prompt: "Reply with exactly: PONG",
+  codec: browserDerivedCodec, // { encodeContent, decodeText, requestKey }
+});
+// res = { ok, answer, reasoning, usage.remaining_limits, warnings, ... }
+```

@@ -270,3 +270,31 @@ data: [DONE]
 ---
 
 *Generated from live Chromium captures of `obscurify.ai` (guest `/anon/chat/completions`), 2026-11-13.*
+
+---
+
+## Client
+
+A zero-dependency Node.js client, streaming parser and CLI live in [`ObscurifyAPI.js`](./ObscurifyAPI.js) / [`src/`](./src/), built on the shared helpers in [`/lib`](../../lib/).
+
+- **Guest, keyless:** `POST /anon/chat/completions` with `origin`/`referer: https://obscurify.ai/` (no auth). Thread reuse via the `x-obscurify-thread` response header.
+- **Catalogs:** `GET /v1/models`, `/frontier_models`, `/uncensored_models`, `/code_mode`.
+- **Streaming:** OpenAI-style SSE (`chat.completion.chunk`), including reasoning deltas and `stream_options.include_usage`.
+- **Offline tests:** mocked `fetch`, no network (`node --test AI/Obscurify/test/*.test.js`).
+
+```bash
+node AI/Obscurify/ObscurifyAPI.js "Reply with exactly: PONG" --stream
+node AI/Obscurify/ObscurifyAPI.js --models --kind all
+node AI/Obscurify/ObscurifyAPI.js --code-mode
+node AI/Obscurify/ObscurifyAPI.js "follow up" --thread thr_... --json
+```
+
+```js
+import { obscurifyChat, ObscurifyClient } from "./AI/Obscurify/ObscurifyAPI.js";
+
+const res = await obscurifyChat({ prompt: "Reply with exactly: PONG" });
+// res = { ok, answer, reasoning, thread, usage, finishReason, model, ... }
+
+const client = new ObscurifyClient({ retries: 1 });
+const models = await client.listModels();
+```
